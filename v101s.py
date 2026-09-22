@@ -1,33 +1,49 @@
 """
-Transformer-Based Attention Framework for
-Noise Reduction and Detail Preservation in Low-Dose CT Imaging — V4-Final
-==========================================================================
-修复清单:
-  FIX-1  BatchNorm2d → GroupNorm
-  FIX-2  patch_inference 中心裁剪拼接
-  FIX-3  PerceptualLoss mean/std 动态对齐 device/dtype
-  FIX-4  patch_size 切换时重建 DataLoader
-  FIX-5  CSAS 显式传入 H, W
-  FIX-6  EdgeAwareLoss Sobel kernel 动态对齐 device/dtype
-  FIX-7  safe_heads() 确保 num_heads 能整除 dim，修复 bc=88 reshape 错误
-  FIX-8  GradScaler / autocast 使用新 API
+    Transformer-Based Attention Framework for
+    Noise Reduction and Detail Preservation in Low-Dose CT Imaging — V4-Final (单卡版)
+    ==========================================================================
+    修复清单:
+      FIX-1  BatchNorm2d → GroupNorm
+      FIX-2  patch_inference 中心裁剪拼接
+      FIX-3  PerceptualLoss mean/std 动态对齐 device/dtype
+      FIX-4  patch_size 切换时重建 DataLoader
+      FIX-5  CSAS 显式传入 H, W
+      FIX-6  EdgeAwareLoss Sobel kernel 动态对齐 device/dtype
+      FIX-7  safe_heads() 确保 num_heads 能整除 dim，修复 bc=88 reshape 错误
+      FIX-8  GradScaler / autocast 使用新 API
 
-新增优化:
-  OPT-1  tta_inference() —— 8 种几何变换 TTA，推理时直接涨分，无需重训
-  OPT-2  Fine-tune 阶段 (epoch 301–400)：lr=5e-6, CosineAnnealingWarmRestarts,
-          更重视 SSIM+Edge 的 CompositeLoss 权重，让模型在已收敛的基础上
-          继续精调高频细节
+    新增优化:
+      OPT-1  tta_inference() —— 8 种几何变换 TTA，推理时直接涨分，无需重训
+      OPT-2  Fine-tune 阶段 (epoch 301–400)：lr=5e-6, CosineAnnealingWarmRestarts,
+              更重视 SSIM+Edge 的 CompositeLoss 权重，让模型在已收敛的基础上
+              继续精调高频细节
 
-数据集划分（10个患者）:
-  训练集 (7): L067, L096, L109, L143, L192, L286, L291
-  验证集 (2): L310, L333
-  测试集 (1): L506
-"""
-import torch.distributed as dist
-import torch.multiprocessing as mp
-from torch.nn.parallel import DistributedDataParallel as DDP
+    单卡改动说明 (相对于 DDP 版):
+      - 移除 torch.distributed / DDP / DistributedSampler / dist.all_reduce
+      - main() 不再接收 rank/world_size，直接使用 cuda:0（或 cpu）
+      - DataLoader 改回普通 shuffle=True 模式
+      - EMA.update() 不再限制 rank==0，每步都更新
+      - 保留全部功能：EMA、TTA、fine-tune、checkpoint 恢复
+
+    数据集划分（10个患者）:
+      训练集 (7): L067, L096, L109, L143, L192, L286, L291
+      验证集 (2): L310, L333
+      测试集 (1): L506
+
+    本版改动 (per-slice CSV patch):
+      NEW  evaluate() 新增 method_name 参数，并在写 {tag}_results.txt 的同时
+           额外写出 {tag}_{method_name}_per_slice.csv，记录每张切片的
+           slice_index / method / psnr / ssim，供跨方法配对显著性检验使用。
+           详见 evaluate() 内的说明与"配对前提"注释。
+    """
+
 import os
-import random, math, os, certifi
+import random
+import math
+import csv
+
+import certifi
+
 os.environ['SSL_CERT_FILE'] = certifi.where()
 os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'expandable_segments:True'
 
@@ -40,30 +56,30 @@ from torch.utils.data import Dataset, DataLoader
 import torchvision.transforms.functional as TF
 from torchvision import models
 import matplotlib
+
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 from skimage.metrics import peak_signal_noise_ratio as psnr_sk
 from skimage.metrics import structural_similarity as ssim_sk
 from copy import deepcopy
 
-
 # =============================================================================
 # 数据集划分
 # =============================================================================
 TRAIN_PATIENTS = ['L067', 'L096', 'L109', 'L143', 'L192', 'L286', 'L291']
-VAL_PATIENTS   = ['L310', 'L333']
-TEST_PATIENTS  = ['L506']
+VAL_PATIENTS = ['L310', 'L333']
+TEST_PATIENTS = ['L506']
 
 # =============================================================================
 # Fine-tune 阶段超参（OPT-2）
 # 当 epoch > FINETUNE_START 时自动切换至精调配置
 # =============================================================================
-FINETUNE_START    = 300   # 在第 300 epoch 正常训练结束后开始 fine-tune
-FINETUNE_EPOCHS   = 100   # 精调轮数，总训练 epoch = 400
-FINETUNE_LR       = 5e-6
-FINETUNE_ETA_MIN  = 1e-7
-FINETUNE_T0       = 20    # CosineAnnealingWarmRestarts T_0
-FINETUNE_T_MULT   = 2     # CosineAnnealingWarmRestarts T_mult
+FINETUNE_START = 300  # 在第 300 epoch 正常训练结束后开始 fine-tune
+FINETUNE_EPOCHS = 100  # 精调轮数，总训练 epoch = 400
+FINETUNE_LR = 5e-6
+FINETUNE_ETA_MIN = 1e-7
+FINETUNE_T0 = 20  # CosineAnnealingWarmRestarts T_0
+FINETUNE_T_MULT = 2  # CosineAnnealingWarmRestarts T_mult
 
 
 # =============================================================================
@@ -71,7 +87,7 @@ FINETUNE_T_MULT   = 2     # CosineAnnealingWarmRestarts T_mult
 # =============================================================================
 def _infer_hw(L, hint_H=None, hint_W=None):
     if hint_H is not None and hint_W is not None:
-        assert hint_H * hint_W == L, f"hint_H*hint_W={hint_H*hint_W} ≠ L={L}"
+        assert hint_H * hint_W == L, f"hint_H*hint_W={hint_H * hint_W} ≠ L={L}"
         return hint_H, hint_W
     H = int(math.isqrt(L))
     while H > 1 and L % H != 0:
@@ -101,7 +117,7 @@ def safe_heads(dim, target_div=64):
 
 def smart_imshow(ax, img_hu, title=''):
     v_mean = float(np.mean(img_hu))
-    v_std  = float(np.std(img_hu))
+    v_std = float(np.std(img_hu))
     if v_mean < -360 or v_mean > 440 or v_std < 1.0:
         vmin = v_mean - 2 * v_std - 1
         vmax = v_mean + 2 * v_std + 1
@@ -117,7 +133,7 @@ def smart_imshow(ax, img_hu, title=''):
 # =============================================================================
 class EMA:
     def __init__(self, model, decay=0.9999):
-        self.decay  = decay
+        self.decay = decay
         self.shadow = deepcopy(model).eval()
         for p in self.shadow.parameters():
             p.requires_grad_(False)
@@ -140,7 +156,7 @@ class DenseLayer(nn.Module):
         super().__init__()
         self.conv = nn.Conv2d(in_ch, growth, 3, padding=1, bias=False)
         self.norm = GN(growth)
-        self.act  = nn.GELU()
+        self.act = nn.GELU()
 
     def forward(self, x):
         return torch.cat([x, self.act(self.norm(self.conv(x)))], dim=1)
@@ -150,12 +166,12 @@ class DenseBlock(nn.Module):
     def __init__(self, in_ch, growth=32):
         super().__init__()
         self.layers = nn.Sequential(
-            DenseLayer(in_ch,            growth),
-            DenseLayer(in_ch + growth,   growth),
-            DenseLayer(in_ch + growth*2, growth),
-            DenseLayer(in_ch + growth*3, growth),
+            DenseLayer(in_ch, growth),
+            DenseLayer(in_ch + growth, growth),
+            DenseLayer(in_ch + growth * 2, growth),
+            DenseLayer(in_ch + growth * 3, growth),
         )
-        self.proj = nn.Conv2d(in_ch + growth*4, in_ch, 1, bias=False)
+        self.proj = nn.Conv2d(in_ch + growth * 4, in_ch, 1, bias=False)
         self.norm = GN(in_ch)
 
     def forward(self, x):
@@ -176,29 +192,29 @@ class RRDB(nn.Module):
 class RRDBEncoder(nn.Module):
     def __init__(self, in_ch=1, bc=88, growth=32):
         super().__init__()
-        self.stem  = nn.Sequential(
+        self.stem = nn.Sequential(
             nn.Conv2d(in_ch, bc, 3, padding=1, bias=False),
             GN(bc), nn.GELU())
-        self.enc1  = nn.Sequential(RRDB(bc, growth), RRDB(bc, growth))
+        self.enc1 = nn.Sequential(RRDB(bc, growth), RRDB(bc, growth))
         self.down1 = nn.MaxPool2d(2)
-        self.enc2  = nn.Sequential(
-            nn.Conv2d(bc, bc*2, 1, bias=False), GN(bc*2), nn.GELU(),
-            RRDB(bc*2, growth), RRDB(bc*2, growth))
+        self.enc2 = nn.Sequential(
+            nn.Conv2d(bc, bc * 2, 1, bias=False), GN(bc * 2), nn.GELU(),
+            RRDB(bc * 2, growth), RRDB(bc * 2, growth))
         self.down2 = nn.MaxPool2d(2)
-        self.enc3  = nn.Sequential(
-            nn.Conv2d(bc*2, bc*4, 1, bias=False), GN(bc*4), nn.GELU(),
-            RRDB(bc*4, growth), RRDB(bc*4, growth))
+        self.enc3 = nn.Sequential(
+            nn.Conv2d(bc * 2, bc * 4, 1, bias=False), GN(bc * 4), nn.GELU(),
+            RRDB(bc * 4, growth), RRDB(bc * 4, growth))
         self.down3 = nn.MaxPool2d(2)
-        self.enc4  = nn.Sequential(
-            nn.Conv2d(bc*4, bc*8, 1, bias=False), GN(bc*8), nn.GELU(),
-            RRDB(bc*8, growth), RRDB(bc*8, growth))
+        self.enc4 = nn.Sequential(
+            nn.Conv2d(bc * 4, bc * 8, 1, bias=False), GN(bc * 8), nn.GELU(),
+            RRDB(bc * 8, growth), RRDB(bc * 8, growth))
         self.down4 = nn.MaxPool2d(2)
 
     def forward(self, x):
-        e1  = self.enc1(self.stem(x))
-        e2  = self.enc2(self.down1(e1))
-        e3  = self.enc3(self.down2(e2))
-        e4  = self.enc4(self.down3(e3))
+        e1 = self.enc1(self.stem(x))
+        e2 = self.enc2(self.down1(e1))
+        e3 = self.enc3(self.down2(e2))
+        e4 = self.enc4(self.down3(e3))
         bot = self.down4(e4)
         return [e1, e2, e3, e4], bot
 
@@ -228,27 +244,27 @@ class WindowAttention(nn.Module):
         # FIX-7: 确保 num_heads 能整除 dim
         while num_heads > 1 and dim % num_heads != 0:
             num_heads -= 1
-        self.dim       = dim
-        self.ws        = ws
+        self.dim = dim
+        self.ws = ws
         self.num_heads = num_heads
-        self.scale     = (dim // num_heads) ** -0.5
+        self.scale = (dim // num_heads) ** -0.5
 
-        self.rpb = nn.Parameter(torch.zeros((2*ws-1)**2, num_heads))
+        self.rpb = nn.Parameter(torch.zeros((2 * ws - 1) ** 2, num_heads))
         nn.init.trunc_normal_(self.rpb, std=0.02)
 
         coords = torch.stack(torch.meshgrid(
             torch.arange(ws), torch.arange(ws), indexing='ij'))
-        cf  = coords.flatten(1)
+        cf = coords.flatten(1)
         rel = cf[:, :, None] - cf[:, None, :]
         rel = rel.permute(1, 2, 0).contiguous()
         rel[:, :, 0] += ws - 1
         rel[:, :, 1] += ws - 1
-        rel[:, :, 0] *= 2*ws - 1
+        rel[:, :, 0] *= 2 * ws - 1
         self.register_buffer('rpi', rel.sum(-1))
 
-        self.qkv       = nn.Linear(dim, dim*3, bias=True)
+        self.qkv = nn.Linear(dim, dim * 3, bias=True)
         self.attn_drop = nn.Dropout(attn_drop)
-        self.proj      = nn.Linear(dim, dim)
+        self.proj = nn.Linear(dim, dim)
         self.proj_drop = nn.Dropout(proj_drop)
 
     def forward(self, x, mask=None):
@@ -259,17 +275,17 @@ class WindowAttention(nn.Module):
         q, k, v = qkv.unbind(0)
         attn = (q * self.scale) @ k.transpose(-2, -1)
 
-        rpb  = self.rpb[self.rpi.view(-1)].view(N, N, self.num_heads)
+        rpb = self.rpb[self.rpi.view(-1)].view(N, N, self.num_heads)
         attn = attn + rpb.permute(2, 0, 1).unsqueeze(0)
 
         if mask is not None:
-            nW   = mask.shape[0]
+            nW = mask.shape[0]
             attn = attn.view(B_ // nW, nW, self.num_heads, N, N)
             attn = attn + mask.unsqueeze(1).unsqueeze(0)
             attn = attn.view(-1, self.num_heads, N, N)
 
         attn = self.attn_drop(torch.softmax(attn, dim=-1))
-        x    = (attn @ v).transpose(1, 2).reshape(B_, N, C)
+        x = (attn @ v).transpose(1, 2).reshape(B_, N, C)
         return self.proj_drop(self.proj(x))
 
 
@@ -280,15 +296,15 @@ class SwinBlock(nn.Module):
     def __init__(self, dim, num_heads, ws=8, shift=False,
                  mlp_ratio=4., drop=0., attn_drop=0.):
         super().__init__()
-        self.ws    = ws
+        self.ws = ws
         self.shift = shift
         self.norm1 = nn.LayerNorm(dim)
         self.norm2 = nn.LayerNorm(dim)
-        hid        = int(dim * mlp_ratio)
-        self.mlp   = nn.Sequential(
+        hid = int(dim * mlp_ratio)
+        self.mlp = nn.Sequential(
             nn.Linear(dim, hid), nn.GELU(), nn.Dropout(drop),
             nn.Linear(hid, dim), nn.Dropout(drop))
-        self.attn  = WindowAttention(dim, ws, num_heads, attn_drop, drop)
+        self.attn = WindowAttention(dim, ws, num_heads, attn_drop, drop)
 
     def _build_mask(self, H, W, ws, shift, device):
         if not shift or min(H, W) <= ws:
@@ -301,7 +317,7 @@ class SwinBlock(nn.Module):
             for ws_ in w_slices:
                 img_mask[:, hs, ws_, :] = cnt
                 cnt += 1
-        mw   = window_partition(img_mask, ws).view(-1, ws*ws)
+        mw = window_partition(img_mask, ws).view(-1, ws * ws)
         mask = mw.unsqueeze(1) - mw.unsqueeze(2)
         mask = mask.masked_fill(mask != 0, -100.).masked_fill(mask == 0, 0.)
         return mask
@@ -310,11 +326,11 @@ class SwinBlock(nn.Module):
         B, L, C = x.shape
         assert L == H * W
 
-        ws    = min(self.ws, H, W)
+        ws = min(self.ws, H, W)
         shift = ws // 2 if self.shift and min(H, W) > ws else 0
 
         sc = x
-        x  = self.norm1(x).view(B, H, W, C)
+        x = self.norm1(x).view(B, H, W, C)
         if shift > 0:
             x = torch.roll(x, (-shift, -shift), (1, 2))
 
@@ -326,16 +342,16 @@ class SwinBlock(nn.Module):
         _, pH, pW, _ = x.shape
 
         mask = self._build_mask(pH, pW, ws, shift > 0, x.device)
-        xw   = window_partition(x, ws)
-        xw   = self.attn(xw.view(-1, ws*ws, C), mask)
-        xw   = xw.view(-1, ws, ws, C)
-        x    = window_reverse(xw, ws, pH, pW)
+        xw = window_partition(x, ws)
+        xw = self.attn(xw.view(-1, ws * ws, C), mask)
+        xw = xw.view(-1, ws, ws, C)
+        x = window_reverse(xw, ws, pH, pW)
 
         if pad_b > 0 or pad_r > 0:
             x = x[:, :H, :W, :].contiguous()
         if shift > 0:
             x = torch.roll(x, (shift, shift), (1, 2))
-        x = x.view(B, H*W, C) + sc
+        x = x.view(B, H * W, C) + sc
         return x + self.mlp(self.norm2(x))
 
 
@@ -347,20 +363,20 @@ class DualScaleBlock(nn.Module):
         super().__init__()
         self.local_attn = SwinBlock(dim, num_heads, ws, shift,
                                     drop=drop, attn_drop=attn_drop)
-        dil            = 4
-        self.glob_dw   = nn.Conv2d(dim, dim, 3, padding=dil, dilation=dil,
-                                   groups=dim, bias=False)
-        self.glob_pw   = nn.Conv2d(dim, dim, 1, bias=False)
+        dil = 4
+        self.glob_dw = nn.Conv2d(dim, dim, 3, padding=dil, dilation=dil,
+                                 groups=dim, bias=False)
+        self.glob_pw = nn.Conv2d(dim, dim, 1, bias=False)
         self.glob_norm = nn.LayerNorm(dim)
-        self.gate      = nn.Sequential(nn.Linear(dim*2, dim), nn.Sigmoid())
-        self.out_norm  = nn.LayerNorm(dim)
+        self.gate = nn.Sequential(nn.Linear(dim * 2, dim), nn.Sigmoid())
+        self.out_norm = nn.LayerNorm(dim)
 
     def forward(self, x, H, W):
         B, L, C = x.shape
-        xl  = self.local_attn(x, H, W)
+        xl = self.local_attn(x, H, W)
         x2d = x.transpose(1, 2).view(B, C, H, W)
-        xg  = self.glob_pw(self.glob_dw(x2d)).flatten(2).transpose(1, 2)
-        xg  = self.glob_norm(xg + x)
+        xg = self.glob_pw(self.glob_dw(x2d)).flatten(2).transpose(1, 2)
+        xg = self.glob_norm(xg + x)
         gate = self.gate(torch.cat([xl, xg], dim=-1))
         return self.out_norm(gate * xl + (1 - gate) * xg)
 
@@ -373,32 +389,32 @@ class CSAS(nn.Module):
         super().__init__()
         self.pool_grid = pool_grid
         # FIX-7: 用 safe_heads 保证整除
-        nh             = safe_heads(dim, target_div=64)
-        self.nh        = nh
-        self.scale     = (dim // nh) ** -0.5
-        self.nq        = nn.LayerNorm(dim)
-        self.nk        = nn.LayerNorm(dim)
-        self.q         = nn.Linear(dim, dim, bias=False)
-        self.k         = nn.Linear(dim, dim, bias=False)
-        self.v         = nn.Linear(dim, dim, bias=False)
-        self.o         = nn.Linear(dim, dim, bias=False)
+        nh = safe_heads(dim, target_div=64)
+        self.nh = nh
+        self.scale = (dim // nh) ** -0.5
+        self.nq = nn.LayerNorm(dim)
+        self.nk = nn.LayerNorm(dim)
+        self.q = nn.Linear(dim, dim, bias=False)
+        self.k = nn.Linear(dim, dim, bias=False)
+        self.v = nn.Linear(dim, dim, bias=False)
+        self.o = nn.Linear(dim, dim, bias=False)
 
     def forward(self, query, kv, H=None, W=None):
         B, Lq, C = query.shape
-        H, W     = _infer_hw(Lq, H, W)
-        g        = min(self.pool_grid, H, W)
+        H, W = _infer_hw(Lq, H, W)
+        g = min(self.pool_grid, H, W)
 
-        kv_2d   = kv.transpose(1, 2).view(B, C, H, W)
+        kv_2d = kv.transpose(1, 2).view(B, C, H, W)
         kv_pool = F.adaptive_avg_pool2d(kv_2d, (g, g))
         kv_flat = kv_pool.flatten(2).transpose(1, 2)
 
         nh, D = self.nh, C // self.nh
-        q = self.q(self.nq(query  )).view(B, Lq,  nh, D).transpose(1, 2)
-        k = self.k(self.nk(kv_flat)).view(B, g*g, nh, D).transpose(1, 2)
-        v = self.v(kv_flat          ).view(B, g*g, nh, D).transpose(1, 2)
+        q = self.q(self.nq(query)).view(B, Lq, nh, D).transpose(1, 2)
+        k = self.k(self.nk(kv_flat)).view(B, g * g, nh, D).transpose(1, 2)
+        v = self.v(kv_flat).view(B, g * g, nh, D).transpose(1, 2)
 
         attn = torch.softmax((q * self.scale) @ k.transpose(-2, -1), dim=-1)
-        out  = (attn @ v).transpose(1, 2).reshape(B, Lq, C)
+        out = (attn @ v).transpose(1, 2).reshape(B, Lq, C)
         return query + self.o(out)
 
 
@@ -408,18 +424,18 @@ class CSAS(nn.Module):
 class CSG(nn.Module):
     def __init__(self, dim, r=16):
         super().__init__()
-        rd           = max(dim // r, 4)
-        self.ch_fc   = nn.Sequential(
+        rd = max(dim // r, 4)
+        self.ch_fc = nn.Sequential(
             nn.Linear(dim, rd), nn.ReLU(True), nn.Linear(rd, dim), nn.Sigmoid())
         self.sp_conv = nn.Sequential(
             nn.Conv2d(2, 1, 7, padding=3, bias=False), nn.Sigmoid())
 
     def forward(self, x, H, W):
         B, L, C = x.shape
-        ch  = self.ch_fc(x.mean(dim=1))
-        x   = x * ch.unsqueeze(1)
+        ch = self.ch_fc(x.mean(dim=1))
+        x = x * ch.unsqueeze(1)
         x2d = x.transpose(1, 2).view(B, C, H, W)
-        sp  = self.sp_conv(torch.cat(
+        sp = self.sp_conv(torch.cat(
             [x2d.mean(1, keepdim=True), x2d.max(1, keepdim=True).values], 1))
         return (x2d * sp).flatten(2).transpose(1, 2)
 
@@ -431,10 +447,10 @@ class TransformerBottleneck(nn.Module):
     def __init__(self, dim, train_grid=16, num_heads=8,
                  depth=4, ws=8, drop=0., attn_drop=0.):
         super().__init__()
-        self.dim        = dim
+        self.dim = dim
         self.train_grid = train_grid
-        self.pos        = nn.Parameter(
-            torch.zeros(1, train_grid*train_grid, dim))
+        self.pos = nn.Parameter(
+            torch.zeros(1, train_grid * train_grid, dim))
         nn.init.trunc_normal_(self.pos, std=0.02)
 
         # FIX-7: bottleneck num_heads 也做安全处理
@@ -452,7 +468,7 @@ class TransformerBottleneck(nn.Module):
             return self.pos
         pe = self.pos.reshape(1, G, G, self.dim).permute(0, 3, 1, 2)
         pe = F.interpolate(pe.float(), (H, W), mode='bilinear', align_corners=False)
-        return pe.permute(0, 2, 3, 1).reshape(1, H*W, self.dim)
+        return pe.permute(0, 2, 3, 1).reshape(1, H * W, self.dim)
 
     def forward(self, x):
         B, C, H, W = x.shape
@@ -468,18 +484,18 @@ class TransformerBottleneck(nn.Module):
 class PatchExpand(nn.Module):
     def __init__(self, in_dim, out_dim):
         super().__init__()
-        self.expand = nn.Linear(in_dim, in_dim*4, bias=False)
-        self.norm   = nn.LayerNorm(in_dim)
-        self.proj   = nn.Linear(in_dim, out_dim, bias=False) \
-                      if in_dim != out_dim else nn.Identity()
+        self.expand = nn.Linear(in_dim, in_dim * 4, bias=False)
+        self.norm = nn.LayerNorm(in_dim)
+        self.proj = nn.Linear(in_dim, out_dim, bias=False) \
+            if in_dim != out_dim else nn.Identity()
 
     def forward(self, x, H, W):
-        x        = self.expand(x)
+        x = self.expand(x)
         B, L, C4 = x.shape
-        C        = C4 // 4
-        x        = x.view(B, H, W, 2, 2, C).permute(0, 1, 3, 2, 4, 5).contiguous()
-        x        = self.norm(x.view(B, 2*H*2*W, C))
-        return self.proj(x), 2*H, 2*W
+        C = C4 // 4
+        x = x.view(B, H, W, 2, 2, C).permute(0, 1, 3, 2, 4, 5).contiguous()
+        x = self.norm(x.view(B, 2 * H * 2 * W, C))
+        return self.proj(x), 2 * H, 2 * W
 
 
 # =============================================================================
@@ -489,13 +505,13 @@ class DecoderStage(nn.Module):
     def __init__(self, in_dim, skip_dim, out_dim, num_heads,
                  ws=8, depth=2, drop=0., attn_drop=0.):
         super().__init__()
-        self.expand    = PatchExpand(in_dim, out_dim)
+        self.expand = PatchExpand(in_dim, out_dim)
         self.skip_proj = nn.Linear(skip_dim, out_dim, bias=False) \
-                         if skip_dim != out_dim else nn.Identity()
-        self.csas      = CSAS(out_dim)
+            if skip_dim != out_dim else nn.Identity()
+        self.csas = CSAS(out_dim)
         # FIX-7: 确保 num_heads 整除 out_dim
-        num_heads      = safe_heads(out_dim, target_div=out_dim // max(1, num_heads))
-        self.blocks    = nn.ModuleList([
+        num_heads = safe_heads(out_dim, target_div=out_dim // max(1, num_heads))
+        self.blocks = nn.ModuleList([
             DualScaleBlock(out_dim, num_heads, ws,
                            shift=(i % 2 == 1),
                            drop=drop, attn_drop=attn_drop)
@@ -523,21 +539,21 @@ class DecoderStage(nn.Module):
 class MultiScaleHead(nn.Module):
     def __init__(self, dim, in_ch=1):
         super().__init__()
-        self.norm   = nn.LayerNorm(dim)
-        self.main   = nn.Sequential(
-            nn.Conv2d(dim,    dim,    3, padding=1, groups=dim, bias=False),
-            nn.Conv2d(dim,    dim//2, 1, bias=False), nn.GELU(),
-            nn.Conv2d(dim//2, in_ch,  1))
+        self.norm = nn.LayerNorm(dim)
+        self.main = nn.Sequential(
+            nn.Conv2d(dim, dim, 3, padding=1, groups=dim, bias=False),
+            nn.Conv2d(dim, dim // 2, 1, bias=False), nn.GELU(),
+            nn.Conv2d(dim // 2, in_ch, 1))
         self.detail = nn.Sequential(
             nn.Conv2d(in_ch, 32, 3, padding=1, bias=False), nn.GELU(),
-            nn.Conv2d(32,    in_ch, 3, padding=1))
-        self.alpha  = nn.Parameter(torch.tensor(0.1))
+            nn.Conv2d(32, in_ch, 3, padding=1))
+        self.alpha = nn.Parameter(torch.tensor(0.1))
 
     def forward(self, tokens, H, W, x_in):
         B, L, C = tokens.shape
-        feat   = self.norm(tokens).transpose(1, 2).view(B, C, H, W)
-        main   = self.main(feat)
-        lp     = F.avg_pool2d(x_in, 3, stride=1, padding=1)
+        feat = self.norm(tokens).transpose(1, 2).view(B, C, H, W)
+        main = self.main(feat)
+        lp = F.avg_pool2d(x_in, 3, stride=1, padding=1)
         detail = self.detail(x_in - lp)
         return (x_in + main + self.alpha.clamp(0, 1) * detail).clamp(-1., 1.)
 
@@ -551,19 +567,19 @@ class LDCTDenoiserV4(nn.Module):
                  dec_depths=(2, 2, 2, 2),
                  drop=0., attn_drop=0.):
         super().__init__()
-        self.encoder    = RRDBEncoder(in_ch, bc, growth)
+        self.encoder = RRDBEncoder(in_ch, bc, growth)
         self.bottleneck = TransformerBottleneck(
-            dim=bc*8, train_grid=16, num_heads=bot_heads,
+            dim=bc * 8, train_grid=16, num_heads=bot_heads,
             depth=bot_depth, ws=ws, drop=drop, attn_drop=attn_drop)
 
         # FIX-7: 用 safe_heads 计算各级 decoder 的 head 数
-        self.dec4 = DecoderStage(bc*8, bc*8, bc*4, safe_heads(bc*4),
+        self.dec4 = DecoderStage(bc * 8, bc * 8, bc * 4, safe_heads(bc * 4),
                                  ws, dec_depths[0], drop, attn_drop)
-        self.dec3 = DecoderStage(bc*4, bc*4, bc*2, safe_heads(bc*2),
+        self.dec3 = DecoderStage(bc * 4, bc * 4, bc * 2, safe_heads(bc * 2),
                                  ws, dec_depths[1], drop, attn_drop)
-        self.dec2 = DecoderStage(bc*2, bc*2, bc,   safe_heads(bc),
+        self.dec2 = DecoderStage(bc * 2, bc * 2, bc, safe_heads(bc),
                                  ws, dec_depths[2], drop, attn_drop)
-        self.dec1 = DecoderStage(bc,   bc,   bc,   safe_heads(bc),
+        self.dec1 = DecoderStage(bc, bc, bc, safe_heads(bc),
                                  ws, dec_depths[3], drop, attn_drop)
         self.head = MultiScaleHead(bc, in_ch)
         self._init_weights()
@@ -574,22 +590,23 @@ class LDCTDenoiserV4(nn.Module):
                 nn.init.trunc_normal_(m.weight, std=0.02)
                 if m.bias is not None: nn.init.zeros_(m.bias)
             elif isinstance(m, (nn.LayerNorm, nn.GroupNorm)):
-                nn.init.ones_(m.weight); nn.init.zeros_(m.bias)
+                nn.init.ones_(m.weight);
+                nn.init.zeros_(m.bias)
             elif isinstance(m, nn.Conv2d):
                 nn.init.kaiming_normal_(m.weight, mode='fan_out')
                 if m.bias is not None: nn.init.zeros_(m.bias)
 
     def forward(self, x):
         B, C, H, W = x.shape
-        skips, bot  = self.encoder(x)
-        bot         = self.bottleneck(bot)
-        bH, bW      = H // 16, W // 16
-        t           = bot.flatten(2).transpose(1, 2)
+        skips, bot = self.encoder(x)
+        bot = self.bottleneck(bot)
+        bH, bW = H // 16, W // 16
+        t = bot.flatten(2).transpose(1, 2)
 
         t, h, w = self.dec4(t, skips[3], bH, bW)
-        t, h, w = self.dec3(t, skips[2], h,  w)
-        t, h, w = self.dec2(t, skips[1], h,  w)
-        t, h, w = self.dec1(t, skips[0], h,  w)
+        t, h, w = self.dec3(t, skips[2], h, w)
+        t, h, w = self.dec2(t, skips[1], h, w)
+        t, h, w = self.dec1(t, skips[0], h, w)
         return self.head(t, h, w, x)
 
 
@@ -599,24 +616,25 @@ class LDCTDenoiserV4(nn.Module):
 class SSIMLoss(nn.Module):
     def __init__(self, window_size=11, data_range=2.0, levels=3):
         super().__init__()
-        self.dr     = data_range
+        self.dr = data_range
         self.levels = levels
-        self.ws     = window_size
-        g   = torch.arange(window_size, dtype=torch.float32) - window_size // 2
-        g   = torch.exp(-(g**2) / (2*1.5**2)); g /= g.sum()
+        self.ws = window_size
+        g = torch.arange(window_size, dtype=torch.float32) - window_size // 2
+        g = torch.exp(-(g ** 2) / (2 * 1.5 ** 2));
+        g /= g.sum()
         self.register_buffer('win', g.outer(g).unsqueeze(0).unsqueeze(0))
 
     def _ssim(self, x, y):
-        C1, C2 = (0.01*self.dr)**2, (0.03*self.dr)**2
+        C1, C2 = (0.01 * self.dr) ** 2, (0.03 * self.dr) ** 2
         pad = self.ws // 2
-        w   = self.win.to(x.device, x.dtype)
-        mx  = F.conv2d(x,   w, padding=pad)
-        my  = F.conv2d(y,   w, padding=pad)
-        mxx = F.conv2d(x*x, w, padding=pad) - mx**2
-        myy = F.conv2d(y*y, w, padding=pad) - my**2
-        mxy = F.conv2d(x*y, w, padding=pad) - mx*my
-        return ((2*mx*my+C1)*(2*mxy+C2) /
-                ((mx**2+my**2+C1)*(mxx+myy+C2))).mean()
+        w = self.win.to(x.device, x.dtype)
+        mx = F.conv2d(x, w, padding=pad)
+        my = F.conv2d(y, w, padding=pad)
+        mxx = F.conv2d(x * x, w, padding=pad) - mx ** 2
+        myy = F.conv2d(y * y, w, padding=pad) - my ** 2
+        mxy = F.conv2d(x * y, w, padding=pad) - mx * my
+        return ((2 * mx * my + C1) * (2 * mxy + C2) /
+                ((mx ** 2 + my ** 2 + C1) * (mxx + myy + C2))).mean()
 
     def forward(self, x, y):
         loss = 0.
@@ -631,15 +649,15 @@ class SSIMLoss(nn.Module):
 class CharbonnierLoss(nn.Module):
     def __init__(self, eps=1e-3):
         super().__init__()
-        self.eps2 = eps**2
+        self.eps2 = eps ** 2
 
     def forward(self, pred, target):
-        return torch.sqrt((pred - target)**2 + self.eps2).mean()
+        return torch.sqrt((pred - target) ** 2 + self.eps2).mean()
 
 
 class FrequencyLoss(nn.Module):
     def forward(self, pred, target):
-        fp = torch.fft.rfft2(pred.float(),   norm='ortho')
+        fp = torch.fft.rfft2(pred.float(), norm='ortho')
         ft = torch.fft.rfft2(target.float(), norm='ortho')
         return F.l1_loss(fp.abs(), ft.abs())
 
@@ -647,16 +665,18 @@ class FrequencyLoss(nn.Module):
 class HaarWaveletLoss(nn.Module):
     @staticmethod
     def _dwt(x):
-        a = x[:, :, 0::2, 0::2]; b = x[:, :, 1::2, 0::2]
-        c = x[:, :, 0::2, 1::2]; d = x[:, :, 1::2, 1::2]
-        return ((a+b+c+d)*0.25, (a-b+c-d)*0.25,
-                (a+b-c-d)*0.25, (a-b-c+d)*0.25)
+        a = x[:, :, 0::2, 0::2];
+        b = x[:, :, 1::2, 0::2]
+        c = x[:, :, 0::2, 1::2];
+        d = x[:, :, 1::2, 1::2]
+        return ((a + b + c + d) * 0.25, (a - b + c - d) * 0.25,
+                (a + b - c - d) * 0.25, (a - b - c + d) * 0.25)
 
     def forward(self, pred, target):
         _, lhp, hlp, hhp = self._dwt(pred)
         _, lht, hlt, hht = self._dwt(target)
         return (F.l1_loss(lhp, lht) + F.l1_loss(hlp, hlt) +
-                0.5*F.l1_loss(hhp, hht)) / 2.5
+                0.5 * F.l1_loss(hhp, hht)) / 2.5
 
 
 class NoiseAwareLoss(nn.Module):
@@ -666,14 +686,15 @@ class NoiseAwareLoss(nn.Module):
 
     def forward(self, pred, target, ldct):
         k, p = self.k, self.k // 2
-        mu  = F.avg_pool2d(ldct,     k, stride=1, padding=p)
-        var = (F.avg_pool2d(ldct**2, k, stride=1, padding=p) - mu**2).clamp(0)
-        w   = (var / (var.mean() + 1e-6)).clamp(0.5, 3.0)
+        mu = F.avg_pool2d(ldct, k, stride=1, padding=p)
+        var = (F.avg_pool2d(ldct ** 2, k, stride=1, padding=p) - mu ** 2).clamp(0)
+        w = (var / (var.mean() + 1e-6)).clamp(0.5, 3.0)
         return (F.l1_loss(pred, target, reduction='none') * w).mean()
 
 
 class EdgeAwareLoss(nn.Module):
     """FIX-6: Sobel kernel 动态对齐 device/dtype"""
+
     def __init__(self):
         super().__init__()
         sx = torch.tensor([[-1, 0, 1], [-2, 0, 2], [-1, 0, 1]],
@@ -686,10 +707,10 @@ class EdgeAwareLoss(nn.Module):
     def forward(self, p, t):
         sx = self.sx.to(p.device, p.dtype)
         sy = self.sy.to(p.device, p.dtype)
-        ep = torch.sqrt(F.conv2d(p, sx, padding=1)**2 +
-                        F.conv2d(p, sy, padding=1)**2 + 1e-6)
-        et = torch.sqrt(F.conv2d(t, sx, padding=1)**2 +
-                        F.conv2d(t, sy, padding=1)**2 + 1e-6)
+        ep = torch.sqrt(F.conv2d(p, sx, padding=1) ** 2 +
+                        F.conv2d(p, sy, padding=1) ** 2 + 1e-6)
+        et = torch.sqrt(F.conv2d(t, sx, padding=1) ** 2 +
+                        F.conv2d(t, sy, padding=1) ** 2 + 1e-6)
         return F.l1_loss(ep, et)
 
 
@@ -709,36 +730,43 @@ class PerceptualLoss(nn.Module):
             p.requires_grad_(False)
         self.layers = ('layer1', 'layer2', 'layer3')
         self.register_buffer('mean',
-            torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1))
+                             torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1))
         self.register_buffer('std',
-            torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1))
+                             torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1))
 
     def forward(self, x, y):
         def prep(t):
-            t3   = t.float().repeat(1, 3, 1, 1)
+            t3 = t.float().repeat(1, 3, 1, 1)
             mean = self.mean.to(t3.device)
-            std  = self.std.to(t3.device)
+            std = self.std.to(t3.device)
             return ((t3 + 1) / 2 - mean) / std
-        self.feats.clear(); self.resnet(prep(x)); xf = self.feats.copy()
-        self.feats.clear(); self.resnet(prep(y)); yf = dict(self.feats)
+
+        self.feats.clear();
+        self.resnet(prep(x));
+        xf = self.feats.copy()
+        self.feats.clear();
+        self.resnet(prep(y));
+        yf = dict(self.feats)
         return sum(F.mse_loss(xf[l], yf[l]) for l in self.layers) / 3
 
     def __del__(self):
         for h in self.hooks:
-            try: h.remove()
-            except: pass
+            try:
+                h.remove()
+            except:
+                pass
 
 
 class CompositeLoss(nn.Module):
     def __init__(self, lc=1.0, ls=1.5, lp=0.05, lf=0.15, lw=0.4, ln=0.3, le=0.3):
         super().__init__()
-        self.charb  = CharbonnierLoss()
-        self.ssim   = SSIMLoss(data_range=2.0, levels=3)
-        self.perc   = PerceptualLoss()
-        self.freq   = FrequencyLoss()
-        self.wav    = HaarWaveletLoss()
-        self.noise  = NoiseAwareLoss()
-        self.edge   = EdgeAwareLoss()
+        self.charb = CharbonnierLoss()
+        self.ssim = SSIMLoss(data_range=2.0, levels=3)
+        self.perc = PerceptualLoss()
+        self.freq = FrequencyLoss()
+        self.wav = HaarWaveletLoss()
+        self.noise = NoiseAwareLoss()
+        self.edge = EdgeAwareLoss()
         self.lc, self.ls, self.lp = lc, ls, lp
         self.lf, self.lw, self.ln = lf, lw, ln
         self.le = le
@@ -751,12 +779,12 @@ class CompositeLoss(nn.Module):
         lw = self.wav(pred, target)
         le = self.edge(pred, target)
         ln = self.noise(pred, target, ldct) if ldct is not None \
-             else torch.zeros(1, device=pred.device)
-        total = (self.lc*lc + self.ls*ls + self.lp*lp +
-                 self.lf*lf + self.lw*lw + self.ln*ln + self.le*le)
-        subs  = dict(charb=lc.item(), ssim=ls.item(), perc=lp.item(),
-                     freq=lf.item(),  wav=lw.item(),  edge=le.item(),
-                     noise=ln.item() if ldct is not None else 0.)
+            else torch.zeros(1, device=pred.device)
+        total = (self.lc * lc + self.ls * ls + self.lp * lp +
+                 self.lf * lf + self.lw * lw + self.ln * ln + self.le * le)
+        subs = dict(charb=lc.item(), ssim=ls.item(), perc=lp.item(),
+                    freq=lf.item(), wav=lw.item(), edge=le.item(),
+                    noise=ln.item() if ldct is not None else 0.)
         return total, subs
 
 
@@ -781,7 +809,7 @@ class LDCTDataset(Dataset):
                                    os.path.join(nd, nf[i])))
 
         self.patch_size = patch_size
-        self.is_train   = (mode == 'train')
+        self.is_train = (mode == 'train')
         print(f"[{mode.upper()}] 患者={avail}  共 {len(self.pairs)} 个切片对")
 
     def set_patch_size(self, ps):
@@ -803,16 +831,16 @@ class LDCTDataset(Dataset):
             _, h, w = ld.shape
             ps = (min(self.patch_size, h, w) // 16) * 16
             ps = max(ps, 64)
-            i  = random.randint(0, h - ps)
-            j  = random.randint(0, w - ps)
+            i = random.randint(0, h - ps)
+            j = random.randint(0, w - ps)
             ld = TF.crop(ld, i, j, ps, ps)
             nd = TF.crop(nd, i, j, ps, ps)
             if random.random() > 0.5: ld, nd = TF.hflip(ld), TF.hflip(nd)
             if random.random() > 0.5: ld, nd = TF.vflip(ld), TF.vflip(nd)
             k = random.randint(0, 3)
-            if k: ld, nd = torch.rot90(ld, k, [1,2]), torch.rot90(nd, k, [1,2])
+            if k: ld, nd = torch.rot90(ld, k, [1, 2]), torch.rot90(nd, k, [1, 2])
             if random.random() > 0.7:
-                f  = random.uniform(0.95, 1.05)
+                f = random.uniform(0.95, 1.05)
                 ld = (ld * f).clamp(-1, 1)
                 nd = (nd * f).clamp(-1, 1)
         return ld, nd
@@ -822,56 +850,61 @@ class LDCTDataset(Dataset):
 # DataLoader
 # =============================================================================
 def get_batch_size(patch_size):
-    if patch_size <= 128: return 96
-    if patch_size <= 192: return 64
-    if patch_size <= 256: return 40
-    return 24
+    # 单卡版：batch size 约为双卡总量的一半，可按显存自行调整
+    if patch_size <= 128: return 72
+    if patch_size <= 192: return 32
+    if patch_size <= 256: return 20
+    return 12
 
 
-def make_train_loader(dataset, batch_size=4, num_workers=4):
-    if len(dataset) == 0:
+def make_loader(dataset, batch_size, num_workers, shuffle=True):
+    if shuffle and len(dataset) == 0:
         raise RuntimeError(
             "训练集为空！请检查 LDCT_ROOT / NDCT_ROOT 路径及 .npy 文件是否存在。")
-    return DataLoader(dataset, batch_size=batch_size, shuffle=True,
-                      num_workers=num_workers, pin_memory=True,
-                      persistent_workers=(num_workers > 0),
-                      prefetch_factor=2 if num_workers > 0 else None)
+    return DataLoader(
+        dataset, batch_size=batch_size, shuffle=shuffle,
+        num_workers=num_workers, pin_memory=True,
+        persistent_workers=(num_workers > 0),
+        prefetch_factor=2 if num_workers > 0 else None,
+    )
 
 
 # =============================================================================
 # OPT-1: TTA Inference (Test-Time Augmentation)
-# 8 种几何变换（D4 对称群）取平均，无需重训，直接在 evaluate/test 时替换
-# patch_inference 使用即可。预期 +0.3~0.6 dB。
+# 8 种几何变换（D4 对称群）取平均，无需重训，推理时直接涨分。
 # =============================================================================
-
 @torch.no_grad()
 def tta_inference(model, img, tile=256, overlap=64, device='cuda'):
     def fwd0(x): return x
+
     def inv0(x): return x
 
     def fwd1(x): return torch.flip(x, [-1])
+
     def inv1(x): return torch.flip(x, [-1])
 
     def fwd2(x): return torch.flip(x, [-2])
+
     def inv2(x): return torch.flip(x, [-2])
 
     def fwd3(x): return torch.rot90(x, 1, [-2, -1])
+
     def inv3(x): return torch.rot90(x, -1, [-2, -1])
 
     def fwd4(x): return torch.rot90(x, 2, [-2, -1])
+
     def inv4(x): return torch.rot90(x, -2, [-2, -1])
 
     def fwd5(x): return torch.rot90(x, 3, [-2, -1])
+
     def inv5(x): return torch.rot90(x, -3, [-2, -1])
 
-    # 正向：先 rot90，再 flip(-1)
-    # 逆向：先 flip(-1)（自逆），再 rot90(-1)  ← 顺序与正向相反
     def fwd6(x): return torch.flip(torch.rot90(x, 1, [-2, -1]), [-1])
+
     def inv6(x): return torch.rot90(torch.flip(x, [-1]), -1, [-2, -1])
 
-    # 正向：先 rot90，再 flip(-2)
-    # 逆向：先 flip(-2)（自逆），再 rot90(-1)
     def fwd7(x): return torch.flip(torch.rot90(x, 1, [-2, -1]), [-2])
+
     def inv7(x): return torch.rot90(torch.flip(x, [-2]), -1, [-2, -1])
 
     tta_transforms = [
@@ -888,14 +921,14 @@ def tta_inference(model, img, tile=256, overlap=64, device='cuda'):
 
 
 # =============================================================================
-# Patch Inference（保持原版不变，tta_inference 内部调用此函数）
+# Patch Inference
 # =============================================================================
 @torch.no_grad()
 def patch_inference(model, img, tile=256, overlap=64, device='cuda'):
     _, C, H, W = img.shape
-    tile   = (tile // 16) * 16
+    tile = (tile // 16) * 16
     margin = overlap // 2
-    step   = tile - overlap
+    step = tile - overlap
 
     pad_h = (tile - H % tile) % tile if H % tile != 0 else 0
     pad_w = (tile - W % tile) % tile if W % tile != 0 else 0
@@ -912,8 +945,8 @@ def patch_inference(model, img, tile=256, overlap=64, device='cuda'):
 
     for y in ys:
         for x in xs:
-            patch = img_p[:, :, y:y+tile, x:x+tile].to(device)
-            pred  = model(patch).cpu()
+            patch = img_p[:, :, y:y + tile, x:x + tile].to(device)
+            pred = model(patch).cpu()
 
             py1 = margin if y > 0 else 0
             py2 = tile - margin if y + tile < oH else tile
@@ -986,91 +1019,58 @@ def vram_check(model, device):
 
 
 # =============================================================================
-# Training
-# =============================================================================
-def train_one_epoch(model, ema, loader, optimizer, criterion,
-                    scaler, device, epoch, history, save_dir):
-    model.train()
-    total, subs_acc = 0., {}
-    os.makedirs(save_dir, exist_ok=True)
-
-    for bi, (ldct, ndct) in enumerate(loader):
-        ldct, ndct = ldct.to(device), ndct.to(device)
-        optimizer.zero_grad(set_to_none=True)
-
-        with torch.amp.autocast('cuda'):
-            pred       = model(ldct)
-            loss, subs = criterion(pred, ndct, ldct)
-
-        scaler.scale(loss).backward()
-        scaler.unscale_(optimizer)
-        torch.nn.utils.clip_grad_norm_(model.parameters(), 0.5)
-        scaler.step(optimizer)
-        scaler.update()
-        ema.update(model)
-
-        total += loss.item()
-        for k, v in subs.items():
-            subs_acc[k] = subs_acc.get(k, 0.) + v
-
-        if (bi + 1) % 500 == 0:
-            with torch.no_grad():
-                model.eval()
-                pred_vis = model(ldct[[0]])
-                model.train()
-            ph = to_hu(pred_vis[0, 0])
-            gh = to_hu(ndct[0, 0])
-            lh = to_hu(ldct[0, 0])
-            ps, ss = compute_metrics(ph, gh)
-
-            fig, ax = plt.subplots(1, 3, figsize=(15, 5))
-            smart_imshow(ax[0], lh, "LDCT")
-            smart_imshow(ax[1], ph, f"Denoised\nPSNR:{ps:.2f} dB | SSIM:{ss:.4f}")
-            smart_imshow(ax[2], gh, "NDCT")
-            plt.savefig(os.path.join(save_dir,
-                f"ep{epoch:03d}_b{bi+1:05d}_P{ps:.2f}_S{ss:.4f}.png"),
-                dpi=150, bbox_inches='tight')
-            plt.close()
-            print(f"  [snap] ep{epoch} b{bi+1}  PSNR:{ps:.2f}  SSIM:{ss:.4f}")
-
-        if bi % 200 == 0:
-            mem = torch.cuda.memory_reserved(device) / 1e9 \
-                  if device.type == 'cuda' else 0
-            sub_str = "  ".join(f"{k}:{v:.4f}" for k, v in subs.items())
-            print(f"  ep{epoch} [{bi}/{len(loader)}]  "
-                  f"loss:{loss.item():.4f}  {sub_str}  VRAM:{mem:.1f}GB")
-
-    n   = len(loader)
-    avg = total / n
-    history['train_loss'].append(avg)
-    for k in subs_acc:
-        history.setdefault(k, []).append(subs_acc[k] / n)
-    print(f"{'='*60}\nEpoch {epoch}  avg_loss:{avg:.4f}\n{'='*60}\n")
-    return avg
-
-
-# =============================================================================
 # Evaluation
-# 注意：use_tta=True 时调用 tta_inference，否则调用 patch_inference
+#
+# per-slice CSV patch:
+#   新增 method_name 参数 + per_slice_rows 累加列表，在写 {tag}_results.txt
+#   的同时，额外写出 {tag}_{method_name}_per_slice.csv。
+#
+#   配对前提：只有当每个方法都在完全相同顺序的切片上评估时，跨方法的
+#   slice_index 才能对齐做配对显著性检验——即 test_loader 必须
+#   shuffle=False（本脚本的 make_loader(..., shuffle=False) 已满足），
+#   且每个 baseline 的推理脚本也要用同样的
+#   LDCTDataset(LDCT_ROOT, NDCT_ROOT, TEST_PATIENTS, mode='test') 构造
+#   方式（按文件名 sorted() 排序，保证顺序确定）。如果某个 baseline 的
+#   dataloader 打乱了顺序，或因为输入尺寸限制悄悄丢弃/裁掉了某张切片，
+#   slice_index 会静默错位，配对检验就会配错图。做配对检验之前，先确认
+#   每个方法 CSV 的行数（对应各自 {tag}_results.txt 里的 N）完全一致。
 # =============================================================================
 @torch.no_grad()
 def evaluate(model, loader, device, save_dir,
-             tile=256, overlap=64, tag='val', use_tta=False):
+             tile=256, overlap=64, tag='val', use_tta=False,
+             method_name='HCT-UNet'):
+    """
+    method_name: 写入逐切片 CSV 的方法标签，方便之后把每个 baseline
+    (DUGAN, CT-Mamba, ...) 的 CSV 拼接成一张 long-format 表用于配对显著性
+    检验。在同一份切片顺序下，对每个模型使用统一的 method_name 规范
+    （见函数上方“配对前提”说明）。
+    """
     os.makedirs(save_dir, exist_ok=True)
     model.eval()
     psnrs, ssims = [], []
+    per_slice_rows = []  # NEW
 
     infer_fn = tta_inference if use_tta else patch_inference
     if use_tta:
         print(f"  [evaluate] TTA 已启用（8 种变换）")
 
     for i, (ldct, ndct) in enumerate(loader):
-        pred   = infer_fn(model, ldct, tile, overlap, device)
-        ph     = to_hu(pred[0, 0])
-        gh     = to_hu(ndct[0, 0])
-        lh     = to_hu(ldct[0, 0])
+        pred = infer_fn(model, ldct, tile, overlap, device)
+        ph = to_hu(pred[0, 0])
+        gh = to_hu(ndct[0, 0])
+        lh = to_hu(ldct[0, 0])
         ps, ss = compute_metrics(ph, gh)
-        psnrs.append(ps); ssims.append(ss)
+        psnrs.append(ps)
+        ssims.append(ss)
+
+        # NEW: 记录这张切片的身份，保证同一个 slice_index 在不同方法的
+        # CSV 中对应同一张物理切片——这是配对检验依赖的关键字段。
+        per_slice_rows.append({
+            'slice_index': i,
+            'method': method_name,
+            'psnr': ps,
+            'ssim': ss,
+        })
 
         if i % 500 == 0:
             fig, ax = plt.subplots(1, 3, figsize=(15, 5))
@@ -1086,142 +1086,112 @@ def evaluate(model, loader, device, save_dir,
     avg_p = float(np.mean(psnrs)); std_p = float(np.std(psnrs))
     avg_s = float(np.mean(ssims)); std_s = float(np.std(ssims))
     tta_tag = "+TTA" if use_tta else ""
-    print(f"\n{'='*60}")
+    print(f"\n{'=' * 60}")
     print(f"[{tag.upper()}]{tta_tag}  N={len(psnrs)}")
     print(f"  PSNR : {avg_p:.2f} ± {std_p:.2f} dB")
     print(f"  SSIM : {avg_s:.4f} ± {std_s:.4f}")
-    print(f"{'='*60}\n")
+    print(f"{'=' * 60}\n")
 
     with open(os.path.join(save_dir, f"{tag}_results.txt"),
               'w', encoding='utf-8') as f:
-        f.write(f"=== V4-Final {tag.upper()}{tta_tag} ===\n\n")
+        f.write(f"=== V4-Final (单卡) {tag.upper()}{tta_tag} ===\n\n")
         f.write(f"PSNR : {avg_p:.2f} ± {std_p:.2f} dB\n")
         f.write(f"SSIM : {avg_s:.4f} ± {std_s:.4f}\n")
         f.write(f"N    : {len(psnrs)}\n")
         f.write(f"torch: {torch.__version__} | device: {device}\n")
+
+    # NEW: 写出配对显著性检验要读取的逐切片 CSV
+    csv_path = os.path.join(save_dir, f"{tag}_{method_name}_per_slice.csv")
+    with open(csv_path, 'w', newline='', encoding='utf-8') as f:
+        writer = csv.DictWriter(f, fieldnames=['slice_index', 'method', 'psnr', 'ssim'])
+        writer.writeheader()
+        writer.writerows(per_slice_rows)
+    print(f"  [per-slice] saved {len(per_slice_rows)} rows → {csv_path}")
+
     return avg_p, avg_s
 
 
 def plot_history(history, save_dir):
-    keys  = [k for k in history if k != 'train_loss']
-    n     = len(keys) + 1
-    fig, axes = plt.subplots(1, n, figsize=(4*n, 4))
+    keys = [k for k in history if k != 'train_loss']
+    n = len(keys) + 1
+    fig, axes = plt.subplots(1, n, figsize=(4 * n, 4))
     ep = range(1, len(history['train_loss']) + 1)
     axes[0].plot(ep, history['train_loss'], 'b-o', ms=3, lw=1.5)
-    axes[0].set_title('Total loss'); axes[0].grid(True)
+    axes[0].set_title('Total loss');
+    axes[0].grid(True)
     for ax, k in zip(axes[1:], keys):
         ax.plot(ep, history[k], ms=3, lw=1.5)
-        ax.set_title(k); ax.grid(True)
+        ax.set_title(k);
+        ax.grid(True)
     plt.tight_layout()
     plt.savefig(os.path.join(save_dir, 'training_curves.png'), dpi=150)
     plt.close()
 
 
 # =============================================================================
-# OPT-2: Fine-tune 阶段优化器 / scheduler / criterion 构建函数
-# 在 main() 中当 epoch 进入 fine-tune 阶段时调用一次
+# OPT-2: Fine-tune 阶段优化器 / scheduler / criterion
 # =============================================================================
-def build_finetune_components(model_ddp, device):
-    """
-    返回为 fine-tune 阶段准备的
-      (optimizer_ft, scheduler_ft, criterion_ft)
-
-    变化要点（相比主训练阶段）:
-      - lr 降至 5e-6，weight_decay=0（已收敛，不再需要正则化）
-      - CosineAnnealingWarmRestarts 提供周期性"重热"，帮助跳出局部极值
-      - loss 权重：增大 ls(SSIM) 和 le(Edge)，减小 lf/lw，
-        引导模型在高频细节和结构边缘上进一步精调
-    """
+def build_finetune_components(model, device):
     optimizer_ft = optim.AdamW(
-        model_ddp.parameters(),
+        model.parameters(),
         lr=FINETUNE_LR,
-        weight_decay=0,           # 精调阶段关闭权重衰减
+        weight_decay=0,
         betas=(0.9, 0.999),
     )
     scheduler_ft = optim.lr_scheduler.CosineAnnealingWarmRestarts(
         optimizer_ft,
-        T_0=FINETUNE_T0,          # 第一个周期长度（epoch 数）
-        T_mult=FINETUNE_T_MULT,   # 后续周期倍增系数
+        T_0=FINETUNE_T0,
+        T_mult=FINETUNE_T_MULT,
         eta_min=FINETUNE_ETA_MIN,
     )
-    # 相比主训练：ls 1.5→1.8，le 0.2→0.5，lf 0.1→0.05，lw 0.2→0.1
     criterion_ft = CompositeLoss(
-        lc=0.8,   # Charbonnier：略降，让 SSIM/Edge 更主导
-        ls=1.8,   # SSIM：升高，强化结构相似性
-        lp=0.05,  # Perceptual：保持
-        lf=0.05,  # Frequency：降低，避免过拟合噪声频率
-        lw=0.1,   # Wavelet：降低
-        ln=0.2,   # NoiseAware：降低（已基本去噪完毕）
-        le=0.5,   # Edge：升高，强化边缘细节保留
+        lc=0.8, ls=1.8, lp=0.05,
+        lf=0.05, lw=0.1, ln=0.2, le=0.5,
     ).to(device)
     return optimizer_ft, scheduler_ft, criterion_ft
 
 
 # =============================================================================
-# DDP 入口
+# Main (单卡)
 # =============================================================================
-def main(rank, world_size):
-    # ── 初始化进程组 ──────────────────────────────────────────────
-    dist.init_process_group(
-        backend='nccl',
-        init_method='env://',
-        world_size=world_size,
-        rank=rank,
-    )
-    torch.cuda.set_device(rank)
-    device = torch.device(f'cuda:{rank}')
-    is_main = (rank == 0)
+def main():
+    # ── 设备 ──────────────────────────────────────────────────────
+    device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
+    print(f"Device: {device}")
+    if device.type == 'cuda':
+        print(f"GPU : {torch.cuda.get_device_name(0)}")
 
     # ── 路径 ──────────────────────────────────────────────────────
-    BASE_DIR  = "/home/user/joshua82/LDCT_Project"
-    SAVE_DIR  = f"{BASE_DIR}/output/checkpoints/v101s"
-    LDCT_ROOT = f"{BASE_DIR}/dataset/QD1mm"
-    NDCT_ROOT = f"{BASE_DIR}/dataset/FD1mm"
+    BASE_DIR = "/home/user/joshua82/LDCT_Project"
+    SAVE_DIR = f"{BASE_DIR}/output/checkpoints/v101s"
+    LDCT_ROOT = f"{BASE_DIR}/dataset/QD301mm"
+    NDCT_ROOT = f"{BASE_DIR}/dataset/FD301mm"
     NUM_WORKERS = 4
 
-    # 总训练轮数 = 主训练 + fine-tune
     NUM_EPOCHS = FINETUNE_START + FINETUNE_EPOCHS  # 默认 400
 
-    if is_main:
-        print(f"Device: {device}  |  world_size={world_size}")
-        print(f"GPU-0 : {torch.cuda.get_device_name(0)}")
-        print(f"GPU-1 : {torch.cuda.get_device_name(1)}")
-        print(f"\n数据集划分:")
-        print(f"  训练集: {TRAIN_PATIENTS}")
-        print(f"  验证集: {VAL_PATIENTS}")
-        print(f"  测试集: {TEST_PATIENTS}")
-        print(f"\n训练阶段: epoch 1–{FINETUNE_START}（主训练）"
-              f" + epoch {FINETUNE_START+1}–{NUM_EPOCHS}（fine-tune）\n")
+    print(f"\n数据集划分:")
+    print(f"  训练集: {TRAIN_PATIENTS}")
+    print(f"  验证集: {VAL_PATIENTS}")
+    print(f"  测试集: {TEST_PATIENTS}")
+    print(f"\n训练阶段: epoch 1–{FINETUNE_START}（主训练）"
+          f" + epoch {FINETUNE_START + 1}–{NUM_EPOCHS}（fine-tune）\n")
 
-    # ── Dataset ───────────────────────────────────────────────────
+    # ── Dataset & DataLoader ──────────────────────────────────────
     train_ds = LDCTDataset(LDCT_ROOT, NDCT_ROOT, TRAIN_PATIENTS,
                            mode='train', patch_size=128)
-    val_ds   = LDCTDataset(LDCT_ROOT, NDCT_ROOT, VAL_PATIENTS,
-                           mode='val',   patch_size=0)
-    test_ds  = LDCTDataset(LDCT_ROOT, NDCT_ROOT, TEST_PATIENTS,
-                           mode='test',  patch_size=0)
+    val_ds = LDCTDataset(LDCT_ROOT, NDCT_ROOT, VAL_PATIENTS,
+                         mode='val', patch_size=0)
+    test_ds = LDCTDataset(LDCT_ROOT, NDCT_ROOT, TEST_PATIENTS,
+                          mode='test', patch_size=0)
 
-    # ── DistributedSampler ────────────────────────────────────────
-    def make_ddp_loader(dataset, batch_size, num_workers, shuffle=True):
-        sampler = torch.utils.data.distributed.DistributedSampler(
-            dataset, num_replicas=world_size, rank=rank, shuffle=shuffle)
-        return DataLoader(
-            dataset, batch_size=batch_size, sampler=sampler,
-            num_workers=num_workers, pin_memory=True,
-            persistent_workers=(num_workers > 0),
-            prefetch_factor=2 if num_workers > 0 else None,
-        ), sampler
+    cur_ps = get_patch_size(1)
+    cur_batch = get_batch_size(cur_ps)
+    train_loader = make_loader(train_ds, cur_batch, NUM_WORKERS, shuffle=True)
+    val_loader = make_loader(val_ds, batch_size=1, num_workers=0, shuffle=False)
+    test_loader = make_loader(test_ds, batch_size=1, num_workers=0, shuffle=False)
 
-    cur_ps    = get_patch_size(1)
-    cur_batch = get_batch_size(cur_ps) // world_size
-    train_loader, train_sampler = make_ddp_loader(
-        train_ds, cur_batch, NUM_WORKERS)
-    val_loader  = DataLoader(val_ds,  batch_size=1, shuffle=False, num_workers=0)
-    test_loader = DataLoader(test_ds, batch_size=1, shuffle=False, num_workers=0)
-
-    if is_main:
-        print(f"[初始] patch={cur_ps}  每卡 batch={cur_batch}  "
-              f"总 batch={cur_batch*world_size}")
+    print(f"[初始] patch={cur_ps}  batch={cur_batch}")
 
     # ── 模型 ──────────────────────────────────────────────────────
     model = LDCTDenoiserV4(
@@ -1231,20 +1201,15 @@ def main(rank, world_size):
         drop=0.05, attn_drop=0.05,
     ).to(device)
 
-    model_ddp = DDP(model, device_ids=[rank],
-                    output_device=rank,
-                    find_unused_parameters=False)
-
-    if is_main:
-        n_params = sum(p.numel() for p in model.parameters()) / 1e6
-        print(f"Parameters: {n_params:.1f}M")
+    n_params = sum(p.numel() for p in model.parameters()) / 1e6
+    print(f"Parameters: {n_params:.1f}M")
 
     ema = EMA(model, decay=0.9999)
 
     # ── 主训练阶段的优化器 / Scheduler ────────────────────────────
-    WARMUP     = 10
-    optimizer  = optim.AdamW(model_ddp.parameters(), lr=1e-4,
-                             weight_decay=5e-5, betas=(0.9, 0.999))
+    WARMUP = 10
+    optimizer = optim.AdamW(model.parameters(), lr=1e-4,
+                            weight_decay=5e-5, betas=(0.9, 0.999))
 
     def lr_lambda(ep):
         if ep < WARMUP:
@@ -1254,9 +1219,9 @@ def main(rank, world_size):
         if 150 <= ep < 155:
             return 0.02 + 0.08 * (ep - 150) / 5
         stages = [
-            (WARMUP,  30,  1.00),
-            (30,      80,  0.60),
-            (85,     150,  0.30),
+            (WARMUP, 30, 1.00),
+            (30, 80, 0.60),
+            (85, 150, 0.30),
             (155, FINETUNE_START, 0.10),
         ]
         for s_start, s_end, peak in stages:
@@ -1267,55 +1232,100 @@ def main(rank, world_size):
 
     scheduler = optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
     criterion = CompositeLoss(lc=1.0, ls=0.8, lp=0.05,
-                              lf=0.1,  lw=0.2, ln=0.4, le=0.2).to(device)
-    scaler    = torch.amp.GradScaler('cuda')
+                              lf=0.1, lw=0.2, ln=0.4, le=0.2).to(device)
+    scaler = torch.amp.GradScaler('cuda')
 
     os.makedirs(SAVE_DIR, exist_ok=True)
-    history     = {'train_loss': []}
-    best_psnr   = 0.
+    history = {'train_loss': []}
+    best_psnr = 0.
     start_epoch = 1
     recent_ckpts = []
+    recent_best_ckpts = []  # 追踪 best_P*.pth 保存顺序，最多保留 3 个；历史最优单独多留一份
+    best_ever_path = None    # 历史最优 checkpoint 的文件路径，清理时永久豁免
 
-    # fine-tune 组件（稍后在循环中按需切换，初始化为 None）
-    optimizer_ft  = None
-    scheduler_ft  = None
-    criterion_ft  = None
-    in_finetune   = False   # 是否已进入 fine-tune 阶段的标志
+    optimizer_ft = None
+    scheduler_ft = None
+    criterion_ft = None
+    in_finetune = False
 
     # ── Checkpoint 恢复 ───────────────────────────────────────────
     def find_best_ckpt(save_dir):
         import glob, re
         best_files = glob.glob(os.path.join(save_dir, 'best_P*.pth'))
         ckpt_files = glob.glob(os.path.join(save_dir, 'ckpt_ep*.pth'))
+
         def extract_psnr(path):
-            m = re.search(r'_P([\d.]+)', os.path.basename(path))
-            return float(m.group(1)) if m else 0.0
+            m = re.search(r'_P(\d+(?:\.\d+)?)', os.path.basename(path))
+            if not m:
+                return 0.0
+            try:
+                return float(m.group(1))
+            except ValueError:
+                return 0.0
+
         candidates = best_files if best_files else ckpt_files
         if not candidates:
             return None, 0.0
         best_path = max(candidates, key=extract_psnr)
         return best_path, extract_psnr(best_path)
 
+    def rebuild_recent_best_ckpts(save_dir):
+        """
+        断点续训时，从磁盘上已存在的 best_P*.pth 文件重建 recent_best_ckpts 队列，
+        按文件名中的 epoch 排序（旧→新），使清理逻辑（保留最近3个）在 resume 后依然生效。
+        """
+        import glob, re
+        files = glob.glob(os.path.join(save_dir, 'best_P*.pth'))
+
+        def extract_epoch(path):
+            m = re.search(r'_ep(\d+)', os.path.basename(path))
+            return int(m.group(1)) if m else 0
+
+        return sorted(files, key=extract_epoch)
+
     ckpt_path, ckpt_psnr = find_best_ckpt(SAVE_DIR)
     if ckpt_path is not None:
-        if is_main:
-            print(f"\n[Resume] {os.path.basename(ckpt_path)}  PSNR={ckpt_psnr:.2f}")
-        ckpt  = torch.load(ckpt_path, map_location=device)
+        print(f"\n[Resume] {os.path.basename(ckpt_path)}  PSNR={ckpt_psnr:.2f}")
+        ckpt = torch.load(ckpt_path, map_location=device)
+        # 兼容 DDP 版 checkpoint（state_dict key 可能带 'module.' 前缀）
         state = {k.replace('module.', ''): v for k, v in ckpt['model'].items()}
         model.load_state_dict(state)
         if 'ema' in ckpt:
             ema.shadow.load_state_dict(ckpt['ema'])
         if 'opt' in ckpt:
             optimizer.load_state_dict(ckpt['opt'])
-        history     = ckpt.get('history', history)
-        best_psnr   = ckpt.get('best_psnr', ckpt_psnr)
+        history = ckpt.get('history', history)
+        best_psnr = ckpt.get('best_psnr', ckpt_psnr)
         start_epoch = ckpt['epoch'] + 1
-        if is_main:
-            print(f"[Resume] 从 epoch {ckpt['epoch']} 恢复，"
-                  f"将从 epoch {start_epoch} 继续\n")
+        in_finetune = ckpt.get('in_finetune', False)
+        recent_best_ckpts = rebuild_recent_best_ckpts(SAVE_DIR)
+        if recent_best_ckpts:
+            import re as _re
+            def _psnr_of(p):
+                m = _re.search(r'best_P(\d+(?:\.\d+)?)_', os.path.basename(p))
+                if not m:
+                    return -1.0
+                try:
+                    return float(m.group(1))
+                except ValueError:
+                    return -1.0
+
+            best_ever_path = max(recent_best_ckpts, key=_psnr_of)
+        print(f"[Resume] 从 epoch {ckpt['epoch']} 恢复，将从 epoch {start_epoch} 继续")
+        print(f"[Resume] 已找到 {len(recent_best_ckpts)} 个历史 best_P*.pth 文件\n")
     else:
-        if is_main:
-            print("\n[Resume] 未找到 checkpoint，从头训练\n")
+        print("\n[Resume] 未找到 checkpoint，从头训练\n")
+
+    # resume 时若磁盘上 best 文件已超出配额（如上次异常退出未及时清理），先做一次存量清理，
+    # 逻辑与训练循环内一致：保留最近 3 份 + 永久保留历史最优 best_ever_path
+    while len(recent_best_ckpts) > 3:
+        oldest_best = recent_best_ckpts.pop(0)
+        if oldest_best == best_ever_path:
+            recent_best_ckpts.append(oldest_best)
+            break
+        if os.path.exists(oldest_best):
+            os.remove(oldest_best)
+            print(f"  [清理best/resume] {os.path.basename(oldest_best)}")
 
     # ── Training Loop ─────────────────────────────────────────────
     for epoch in range(start_epoch, NUM_EPOCHS + 1):
@@ -1326,48 +1336,40 @@ def main(rank, world_size):
         if epoch == FINETUNE_START + 1 and not in_finetune:
             in_finetune = True
             optimizer_ft, scheduler_ft, criterion_ft = \
-                build_finetune_components(model_ddp, device)
-            # 重置 GradScaler，避免主训练阶段的 scale 值影响精调
+                build_finetune_components(model, device)
             scaler = torch.amp.GradScaler('cuda')
-            if is_main:
-                print(f"\n{'='*60}")
-                print(f"[OPT-2] 切换至 Fine-tune 阶段")
-                print(f"  optimizer : AdamW  lr={FINETUNE_LR}  weight_decay=0")
-                print(f"  scheduler : CosineAnnealingWarmRestarts "
-                      f"T_0={FINETUNE_T0}  T_mult={FINETUNE_T_MULT}")
-                print(f"  criterion : lc=0.8 ls=1.8 lp=0.05 "
-                      f"lf=0.05 lw=0.1 ln=0.2 le=0.5")
-                print(f"{'='*60}\n")
+            print(f"\n{'=' * 60}")
+            print(f"[OPT-2] 切换至 Fine-tune 阶段")
+            print(f"  optimizer : AdamW  lr={FINETUNE_LR}  weight_decay=0")
+            print(f"  scheduler : CosineAnnealingWarmRestarts "
+                  f"T_0={FINETUNE_T0}  T_mult={FINETUNE_T_MULT}")
+            print(f"  criterion : lc=0.8 ls=1.8 lp=0.05 "
+                  f"lf=0.05 lw=0.1 ln=0.2 le=0.5")
+            print(f"{'=' * 60}\n")
 
-        # 当前阶段使用的组件
-        cur_optimizer = optimizer_ft  if in_finetune else optimizer
-        cur_scheduler = scheduler_ft  if in_finetune else scheduler
-        cur_criterion = criterion_ft  if in_finetune else criterion
+        cur_optimizer = optimizer_ft if in_finetune else optimizer
+        cur_scheduler = scheduler_ft if in_finetune else scheduler
+        cur_criterion = criterion_ft if in_finetune else criterion
 
         # ----------------------------------------------------------
-        # patch size / batch size 切换（fine-tune 阶段固定用 256）
+        # patch size / batch size 切换
         # ----------------------------------------------------------
         if in_finetune:
-            target_ps    = 256
-            target_batch = get_batch_size(target_ps) // world_size
+            target_ps = 256
+            target_batch = get_batch_size(target_ps)
         else:
-            target_ps    = get_patch_size(epoch)
-            target_batch = get_batch_size(target_ps) // world_size
+            target_ps = get_patch_size(epoch)
+            target_batch = get_batch_size(target_ps)
 
         if target_ps != cur_ps or target_batch != cur_batch:
             train_ds.set_patch_size(target_ps)
-            train_loader, train_sampler = make_ddp_loader(
-                train_ds, target_batch, NUM_WORKERS)
-            if is_main:
-                print(f"[Epoch {epoch}] patch {cur_ps}→{target_ps}  "
-                      f"每卡 batch {cur_batch}→{target_batch}  "
-                      f"总 batch {target_batch*world_size}")
+            train_loader = make_loader(train_ds, target_batch, NUM_WORKERS, shuffle=True)
+            print(f"[Epoch {epoch}] patch {cur_ps}→{target_ps}  "
+                  f"batch {cur_batch}→{target_batch}")
             cur_ps, cur_batch = target_ps, target_batch
 
-        train_sampler.set_epoch(epoch)
-
         # ── 单 epoch 训练 ─────────────────────────────────────────
-        model_ddp.train()
+        model.train()
         total, subs_acc = 0., {}
 
         for bi, (ldct, ndct) in enumerate(train_loader):
@@ -1375,27 +1377,25 @@ def main(rank, world_size):
             cur_optimizer.zero_grad(set_to_none=True)
 
             with torch.amp.autocast('cuda'):
-                pred       = model_ddp(ldct)
+                pred = model(ldct)
                 loss, subs = cur_criterion(pred, ndct, ldct)
 
             scaler.scale(loss).backward()
             scaler.unscale_(cur_optimizer)
-            torch.nn.utils.clip_grad_norm_(model_ddp.parameters(), 0.5)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 0.5)
             scaler.step(cur_optimizer)
             scaler.update()
-
-            if is_main:
-                ema.update(model)
+            ema.update(model)  # 单卡：每步都更新 EMA
 
             total += loss.item()
             for k, v in subs.items():
                 subs_acc[k] = subs_acc.get(k, 0.) + v
 
-            if is_main and (bi + 1) % 500 == 0:
-                model_ddp.eval()
+            if (bi + 1) % 500 == 0:
+                model.eval()
                 with torch.no_grad():
-                    pred_vis = model_ddp(ldct[[0]])
-                model_ddp.train()
+                    pred_vis = model(ldct[[0]])
+                model.train()
                 ph = to_hu(pred_vis[0, 0])
                 gh = to_hu(ndct[0, 0])
                 lh = to_hu(ldct[0, 0])
@@ -1403,56 +1403,51 @@ def main(rank, world_size):
                 fig, ax = plt.subplots(1, 3, figsize=(15, 5))
                 smart_imshow(ax[0], lh, "LDCT")
                 smart_imshow(ax[1], ph,
-                    f"Denoised\nPSNR:{ps:.2f} dB | SSIM:{ss:.4f}")
+                             f"Denoised\nPSNR:{ps:.2f} dB | SSIM:{ss:.4f}")
                 smart_imshow(ax[2], gh, "NDCT")
                 ft_tag = "_ft" if in_finetune else ""
                 plt.savefig(os.path.join(SAVE_DIR,
-                    f"ep{epoch:03d}{ft_tag}_b{bi+1:05d}_P{ps:.2f}_S{ss:.4f}.png"),
-                    dpi=150, bbox_inches='tight')
+                                         f"ep{epoch:03d}{ft_tag}_b{bi + 1:05d}_P{ps:.2f}_S{ss:.4f}.png"),
+                            dpi=150, bbox_inches='tight')
                 plt.close()
-                print(f"  [snap] ep{epoch}{ft_tag} b{bi+1}  "
+                print(f"  [snap] ep{epoch}{ft_tag} b{bi + 1}  "
                       f"PSNR:{ps:.2f}  SSIM:{ss:.4f}")
 
-            if is_main and bi % 200 == 0:
-                mem = torch.cuda.memory_reserved(device) / 1e9
+            if bi % 200 == 0:
+                mem = torch.cuda.memory_reserved(device) / 1e9 \
+                    if device.type == 'cuda' else 0
                 sub_str = "  ".join(f"{k}:{v:.4f}" for k, v in subs.items())
                 print(f"  ep{epoch} [{bi}/{len(train_loader)}]  "
                       f"loss:{loss.item():.4f}  {sub_str}  VRAM:{mem:.1f}GB")
 
-        # 跨卡汇总 loss
-        loss_tensor = torch.tensor(total / len(train_loader), device=device)
-        dist.all_reduce(loss_tensor, op=dist.ReduceOp.AVG)
-        avg_loss = loss_tensor.item()
-
-        if is_main:
-            history['train_loss'].append(avg_loss)
-            for k in subs_acc:
-                history.setdefault(k, []).append(
-                    subs_acc[k] / len(train_loader))
-            print(f"{'='*60}\nEpoch {epoch}  avg_loss:{avg_loss:.4f}\n{'='*60}\n")
+        avg_loss = total / len(train_loader)
+        history['train_loss'].append(avg_loss)
+        for k in subs_acc:
+            history.setdefault(k, []).append(subs_acc[k] / len(train_loader))
+        print(f"{'=' * 60}\nEpoch {epoch}  avg_loss:{avg_loss:.4f}\n{'=' * 60}\n")
 
         cur_scheduler.step()
 
-        # ── 验证 & 保存（只 rank-0）──────────────────────────────
-        if is_main and epoch % 10 == 0:
+        # ── 验证 & 保存 ───────────────────────────────────────────
+        if epoch % 10 == 0:
             ema.eval()
-            # OPT-1: 在 fine-tune 阶段的验证中自动启用 TTA
-            use_tta_eval = in_finetune
+            use_tta_eval = in_finetune  # fine-tune 阶段自动启用 TTA
             avg_p, avg_s = evaluate(
                 ema.shadow, val_loader, device,
                 SAVE_DIR, tile=256, overlap=64,
                 tag=f'val_ep{epoch}',
-                use_tta=use_tta_eval)
-            model_ddp.train()
+                use_tta=use_tta_eval,
+                method_name='HCT-UNet')
+            model.train()
 
             save_data = {
-                'epoch':       epoch,
-                'best_psnr':   best_psnr,
-                'model':       model.state_dict(),
-                'ema':         ema.shadow.state_dict(),
-                'opt':         cur_optimizer.state_dict(),
-                'sched':       cur_scheduler.state_dict(),
-                'history':     history,
+                'epoch': epoch,
+                'best_psnr': best_psnr,
+                'model': model.state_dict(),
+                'ema': ema.shadow.state_dict(),
+                'opt': cur_optimizer.state_dict(),
+                'sched': cur_scheduler.state_dict(),
+                'history': history,
                 'in_finetune': in_finetune,
             }
             ckpt_save_path = os.path.join(
@@ -1474,33 +1469,43 @@ def main(rank, world_size):
                 torch.save(save_data, best_save_path)
                 print(f"  [best] PSNR={avg_p:.2f} dB → {best_save_path}")
 
+                # 这份就是目前为止的历史最优，永久保留，不计入"最近3次"的滚动配额
+                best_ever_path = best_save_path
+                recent_best_ckpts.append(best_save_path)
+
+                # 只清理"最近 best"队列中超出 3 份、且不是历史最优的旧文件
+                while len(recent_best_ckpts) > 3:
+                    oldest_best = recent_best_ckpts.pop(0)
+                    if oldest_best == best_ever_path:
+                        # 历史最优恰好排到队首也不删；重新放回队尾占位，避免死循环
+                        recent_best_ckpts.append(oldest_best)
+                        break
+                    if os.path.exists(oldest_best):
+                        os.remove(oldest_best)
+                        print(f"  [清理best] {os.path.basename(oldest_best)}")
+
             print(f"  [ckpt] ep{epoch:03d}  "
                   f"PSNR={avg_p:.2f}  (best={best_psnr:.2f})")
 
     # ── 训练结束 ──────────────────────────────────────────────────
-    if is_main:
-        print("\n训练完成！最终验证集评估 (EMA + TTA)...")
-        ema.eval()
-        # 最终评估始终启用 TTA
-        evaluate(ema.shadow, val_loader, device, SAVE_DIR,
-                 tile=256, overlap=64, tag='final_val', use_tta=True)
-        plot_history(history, SAVE_DIR)
+    print("\n训练完成！最终验证集评估 (EMA + TTA)...")
+    ema.eval()
+    evaluate(ema.shadow, val_loader, device, SAVE_DIR,
+             tile=256, overlap=64, tag='final_val', use_tta=True,
+             method_name='HCT-UNet')
+    plot_history(history, SAVE_DIR)
 
-        print("\n测试集最终评估 (EMA + TTA)...")
-        evaluate(ema.shadow, test_loader, device, SAVE_DIR,
-                 tile=256, overlap=64, tag='test_final', use_tta=True)
-        print(f"\n所有文件保存至: {SAVE_DIR}")
-
-    dist.destroy_process_group()
+    print("\n测试集最终评估 (EMA + TTA)...")
+    evaluate(ema.shadow, test_loader, device, SAVE_DIR,
+             tile=256, overlap=64, tag='test_final', use_tta=True,
+             method_name='HCT-UNet')
+    print(f"\n所有文件保存至: {SAVE_DIR}")
 
 
 # =============================================================================
-# torchrun 入口
+# 入口
 # =============================================================================
 if __name__ == '__main__':
-    world_size = torch.cuda.device_count()
-    assert world_size >= 2, f"需要至少 2 张 GPU，检测到 {world_size} 张"
-    print(f"检测到 {world_size} 张 GPU，启动 DDP 训练")
-
-    rank = int(os.environ.get('LOCAL_RANK', 0))
-    main(rank, world_size)
+    assert torch.cuda.is_available(), "未检测到 CUDA 设备，请确认环境配置"
+    print(f"检测到 GPU: {torch.cuda.get_device_name(0)}")
+    main()

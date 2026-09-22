@@ -1,36 +1,22 @@
 """
 Transformer-Based Attention Framework for
-Noise Reduction and Detail Preservation in Low-Dose CT Imaging — V5
-====================================================================
-基于 V4-Final 的全面升级，目标 PSNR ≥ 47 dB
+Noise Reduction and Detail Preservation in Low-Dose CT Imaging — V5-Fixed-CT
+=============================================================================
+基于 V5-Fixed 的 Loss 优化版本
 
-【单卡版本】针对单张 A100 80GB 适配
-  - 移除所有 DDP / torch.distributed 相关代码
-  - 移除 DistributedSampler，改用普通 DataLoader
-  - Batch size 重新标定（A100 80GB AMP 下）:
-      patch=128 → batch=48
-      patch=192 → batch=24
-      patch=256 → batch=12
-      patch=320 → batch=6
-      patch=384 → batch=3
-  - NUM_WORKERS 建议设为 8（单卡 I/O 瓶颈更明显）
-  - vram_check 阈值调整为 80GB 卡适用
-  - 其余架构 / 损失函数 / 训练逻辑与 V5 DDP 版完全一致
+【本版改动（相对 V5-Fixed）】
+  MOD-1  PerceptualLoss: ImageNet 归一化 → CT 域实测统计
+           mean: [0.485,0.456,0.406] → [0.2135,0.2135,0.2135]
+           std:  [0.229,0.224,0.225] → [0.1932,0.1932,0.1932]
+           （来源：4267 张训练集 NDCT 切片实测，[0,1] 范围）
+  MOD-2  PerceptualLoss: 新增 layer4 特征，加权求和（层权重 0.5/1.0/1.0/0.3）
+  MOD-3  FrequencyLoss: 新增相位一致性约束（phase_weight=0.1）
+  MOD-4  HaarWaveletLoss: 单层 → 3 级递归分解，高频子带权重递增
+  MOD-5  辅助头 loss: 新增 EdgeAwareLoss 约束（dec3×0.2，dec2×0.1）
 
-升级清单（相对 V4-Final，原 V5 特性完整保留）:
-  UPG-1  bc=88 → bc=96
-  UPG-2  bot_depth=4 → 6，dec_depths=(2,2,2,2) → (3,3,2,2)
-  UPG-3  DCAT（双向交叉注意力）替换 CSAS
-  UPG-4  MultiScaleHead 增加 HFE 高频增强分支
-  UPG-5  GradientConsistencyLoss（幅度 + 方向双约束）
-  UPG-6  DropPath 正则化
-  UPG-7  动态损失权重调度（epoch > 200 生效）
-  UPG-8  Patch schedule 优化
-  UPG-9  EMA decay fine-tune 阶段 0.99995
-  UPG-10 数据增强：噪声注入 / Gamma 校正 / 局部遮挡
-  UPG-11 TTA 升级为亮度扰动 × 几何变换（24 次推理）
-  UPG-12 Fine-tune criterion 加入 GradientConsistencyLoss
-  UPG-13 BASE_LR=2e-4，WARMUP=5
+【保留 V5-Fixed 全部修复与升级】
+  FIX-1~9 全部保留
+  UPG-1~13 全部保留
 
 数据集划分（10个患者）:
   训练集 (7): L067, L096, L109, L143, L192, L286, L291
@@ -75,6 +61,23 @@ FINETUNE_LR      = 5e-6
 FINETUNE_ETA_MIN = 1e-7
 FINETUNE_T0      = 20
 FINETUNE_T_MULT  = 2
+
+# =============================================================================
+# FIX-6: GradientConsistencyLoss 渐进系数
+# =============================================================================
+GRAD_LOSS_START = 100
+GRAD_LOSS_END   = 300
+GRAD_LOSS_MAX   = 0.15
+
+
+def get_grad_loss_weight(epoch):
+    if epoch < GRAD_LOSS_START:
+        return 0.0
+    if epoch >= GRAD_LOSS_END:
+        return GRAD_LOSS_MAX
+    t = (epoch - GRAD_LOSS_START) / max(1, GRAD_LOSS_END - GRAD_LOSS_START)
+    return GRAD_LOSS_MAX * t
+
 
 # =============================================================================
 # 工具函数
@@ -297,7 +300,7 @@ class WindowAttention(nn.Module):
 
 
 # =============================================================================
-# SwinBlock（UPG-6: DropPath）
+# SwinBlock
 # =============================================================================
 class SwinBlock(nn.Module):
     def __init__(self, dim, num_heads, ws=8, shift=False,
@@ -366,7 +369,7 @@ class SwinBlock(nn.Module):
 
 
 # =============================================================================
-# DualScaleBlock（UPG-6: DropPath）
+# DualScaleBlock
 # =============================================================================
 class DualScaleBlock(nn.Module):
     def __init__(self, dim, num_heads, ws=8, shift=False,
@@ -396,7 +399,7 @@ class DualScaleBlock(nn.Module):
 
 
 # =============================================================================
-# UPG-3: DCAT（双向交叉注意力）
+# DCAT（双向交叉注意力，FIX-4/5）
 # =============================================================================
 class DCAT(nn.Module):
     def __init__(self, dim, pool_grid=8):
@@ -419,12 +422,14 @@ class DCAT(nn.Module):
         self.v2 = nn.Linear(dim, dim, bias=False)
 
         self.gate     = nn.Sequential(nn.Linear(dim * 2, dim), nn.Sigmoid())
+        nn.init.constant_(self.gate[0].bias, -2.0)   # FIX-4
+
         self.out_norm = nn.LayerNorm(dim)
         self.o1       = nn.Linear(dim, dim, bias=False)
         self.o2       = nn.Linear(dim, dim, bias=False)
 
     def _cross_attn(self, q_src, kv_src, q_lin, k_lin, v_lin,
-                     nq_ln, nk_ln, H, W):
+                    nq_ln, nk_ln, H, W):
         B, Lq, C = q_src.shape
         g = min(self.pool_grid, H, W)
         kv_2d   = kv_src.transpose(1, 2).view(B, C, H, W)
@@ -446,8 +451,10 @@ class DCAT(nn.Module):
         out1 = self.o1(self._cross_attn(
             x, skip, self.q1, self.k1, self.v1,
             self.norm_q1, self.norm_k1, H, W))
+
+        skip_sg = skip.detach()   # FIX-5
         out2 = self.o2(self._cross_attn(
-            skip, x, self.q2, self.k2, self.v2,
+            skip_sg, x, self.q2, self.k2, self.v2,
             self.norm_q2, self.norm_k2, H, W))
 
         gate = self.gate(torch.cat([out1, out2], dim=-1))
@@ -477,7 +484,7 @@ class CSG(nn.Module):
 
 
 # =============================================================================
-# TransformerBottleneck（UPG-2: depth=6；UPG-6: stochastic depth）
+# TransformerBottleneck
 # =============================================================================
 class TransformerBottleneck(nn.Module):
     def __init__(self, dim, train_grid=16, num_heads=8,
@@ -536,7 +543,7 @@ class PatchExpand(nn.Module):
 
 
 # =============================================================================
-# DecoderStage（UPG-3: DCAT；UPG-6: DropPath）
+# DecoderStage
 # =============================================================================
 class DecoderStage(nn.Module):
     def __init__(self, in_dim, skip_dim, out_dim, num_heads,
@@ -572,7 +579,7 @@ class DecoderStage(nn.Module):
 
 
 # =============================================================================
-# UPG-4: MultiScaleHead（HFE 高频增强分支）
+# MultiScaleHead
 # =============================================================================
 class MultiScaleHead(nn.Module):
     def __init__(self, dim, in_ch=1):
@@ -608,9 +615,33 @@ class MultiScaleHead(nn.Module):
 
 
 # =============================================================================
-# Full Model（UPG-1/2/3/4/6）
+# AuxHead（FIX-7: 深度监督辅助输出头）
 # =============================================================================
-class LDCTDenoiserV5(nn.Module):
+class AuxHead(nn.Module):
+    def __init__(self, dim, in_ch=1):
+        super().__init__()
+        self.norm = nn.LayerNorm(dim)
+        self.proj = nn.Sequential(
+            nn.Conv2d(dim,    dim // 2, 1, bias=False),
+            nn.GELU(),
+            nn.Conv2d(dim // 2, in_ch, 1),
+        )
+
+    def forward(self, tokens, H, W, x_in):
+        B, L, C = tokens.shape
+        feat = self.norm(tokens).transpose(1, 2).view(B, C, H, W)
+        out  = self.proj(feat)
+        _, _, Hin, Win = x_in.shape
+        if out.shape[-2:] != (Hin, Win):
+            out = F.interpolate(out.float(), (Hin, Win),
+                                mode='bilinear', align_corners=False)
+        return (x_in + out).clamp(-1., 1.)
+
+
+# =============================================================================
+# Full Model
+# =============================================================================
+class LDCTDenoiserV5Fixed(nn.Module):
     def __init__(self, in_ch=1, bc=96, growth=32,
                  bot_depth=6, bot_heads=8, ws=8,
                  dec_depths=(3, 3, 2, 2),
@@ -632,6 +663,10 @@ class LDCTDenoiserV5(nn.Module):
         self.dec1 = DecoderStage(bc,   bc,   bc,   8, ws, dec_depths[3],
                                  drop, attn_drop, drop_path_rate * 0.3)
         self.head = MultiScaleHead(bc, in_ch)
+
+        self.aux_head3 = AuxHead(bc*2, in_ch)
+        self.aux_head2 = AuxHead(bc,   in_ch)
+
         self._init_weights()
 
     def _init_weights(self):
@@ -652,11 +687,18 @@ class LDCTDenoiserV5(nn.Module):
         bH, bW      = H // 16, W // 16
         t           = bot.flatten(2).transpose(1, 2)
 
-        t, h, w = self.dec4(t, skips[3], bH, bW)
-        t, h, w = self.dec3(t, skips[2], h,  w)
-        t, h, w = self.dec2(t, skips[1], h,  w)
-        t, h, w = self.dec1(t, skips[0], h,  w)
-        return self.head(t, h, w, x)
+        t, h, w     = self.dec4(t, skips[3], bH, bW)
+        t3, h3, w3  = self.dec3(t, skips[2], h,  w)
+        t2, h2, w2  = self.dec2(t3, skips[1], h3, w3)
+        t1, h1, w1  = self.dec1(t2, skips[0], h2, w2)
+        main_out    = self.head(t1, h1, w1, x)
+
+        if self.training:
+            aux3 = self.aux_head3(t3, h3, w3, x)
+            aux2 = self.aux_head2(t2, h2, w2, x)
+            return main_out, aux3, aux2
+
+        return main_out
 
 
 # =============================================================================
@@ -703,26 +745,84 @@ class CharbonnierLoss(nn.Module):
         return torch.sqrt((pred - target)**2 + self.eps2).mean()
 
 
+# =============================================================================
+# ★ MOD-3: FrequencyLoss 新增相位一致性约束
+# =============================================================================
 class FrequencyLoss(nn.Module):
+    def __init__(self, phase_weight=0.1):
+        """
+        phase_weight: 相位损失权重，建议范围 0.05~0.15
+                      太高会不稳定（相位在低幅度区域本身不可靠）
+        """
+        super().__init__()
+        self.phase_weight = phase_weight   # ★ MOD-3
+
     def forward(self, pred, target):
         fp = torch.fft.rfft2(pred.float(),   norm='ortho')
         ft = torch.fft.rfft2(target.float(), norm='ortho')
-        return F.l1_loss(fp.abs(), ft.abs())
+
+        # 原有：幅度谱 L1
+        loss_amp = F.l1_loss(fp.abs(), ft.abs())
+
+        # ★ MOD-3: 相位一致性约束（仅在高幅度区域有效）
+        if self.phase_weight > 0:
+            # 以目标图像幅度均值为阈值，过滤低幅度（不可靠相位）
+            amp_mask = (ft.abs() > ft.abs().mean()).float()
+            phase_diff = torch.angle(fp) - torch.angle(ft)
+            # 处理相位 [-π, π] 环绕
+            phase_diff = torch.atan2(torch.sin(phase_diff),
+                                     torch.cos(phase_diff))
+            loss_phase = (phase_diff.abs() * amp_mask).mean()
+            return loss_amp + self.phase_weight * loss_phase
+
+        return loss_amp
 
 
+# =============================================================================
+# ★ MOD-4: HaarWaveletLoss 扩展为 3 级递归分解
+# =============================================================================
 class HaarWaveletLoss(nn.Module):
+    """
+    原版：单层 DWT，只约束一级高频子带
+    新版：3 级递归分解，高频子带权重随层数递增（越细节越重要）
+    计算量约增加 20%，对 CT 中频噪声约束更充分
+    """
     @staticmethod
     def _dwt(x):
         a = x[:, :, 0::2, 0::2]; b = x[:, :, 1::2, 0::2]
         c = x[:, :, 0::2, 1::2]; d = x[:, :, 1::2, 1::2]
-        return ((a+b+c+d)*0.25, (a-b+c-d)*0.25,
-                (a+b-c-d)*0.25, (a-b-c+d)*0.25)
+        ll = (a + b + c + d) * 0.25
+        lh = (a - b + c - d) * 0.25
+        hl = (a + b - c - d) * 0.25
+        hh = (a - b - c + d) * 0.25
+        return ll, lh, hl, hh
 
-    def forward(self, pred, target):
-        _, lhp, hlp, hhp = self._dwt(pred)
-        _, lht, hlt, hht = self._dwt(target)
-        return (F.l1_loss(lhp, lht) + F.l1_loss(hlp, hlt) +
-                0.5*F.l1_loss(hhp, hht)) / 2.5
+    def forward(self, pred, target, levels=3):   # ★ MOD-4
+        # 各级高频子带权重：越深层（越细节）权重越大
+        hf_weights = [0.5, 1.0, 1.5]
+
+        loss = 0.
+        p, t = pred, target
+
+        for lvl in range(levels):
+            # 确保尺寸足够分解（最小 2×2）
+            if p.shape[-1] < 2 or p.shape[-2] < 2:
+                break
+
+            ll_p, lhp, hlp, hhp = self._dwt(p)
+            ll_t, lht, hlt, hht = self._dwt(t)
+
+            w = hf_weights[min(lvl, len(hf_weights) - 1)]
+            loss += w * (F.l1_loss(lhp, lht) +
+                         F.l1_loss(hlp, hlt) +
+                         0.5 * F.l1_loss(hhp, hht))
+
+            # 继续对低频子带分解
+            p, t = ll_p, ll_t
+
+        # 归一化：除以实际使用的权重之和 × 1.5（LH+HL+0.5HH 的平均分母）
+        total_w = sum(hf_weights[:levels]) * 1.5
+        return loss / total_w
 
 
 class NoiseAwareLoss(nn.Module):
@@ -758,9 +858,6 @@ class EdgeAwareLoss(nn.Module):
         return F.l1_loss(ep, et)
 
 
-# =============================================================================
-# UPG-5: GradientConsistencyLoss
-# =============================================================================
 class GradientConsistencyLoss(nn.Module):
     def __init__(self):
         super().__init__()
@@ -781,42 +878,74 @@ class GradientConsistencyLoss(nn.Module):
 
         mag_p = torch.sqrt(gxp**2 + gyp**2 + 1e-6)
         mag_t = torch.sqrt(gxt**2 + gyt**2 + 1e-6)
-        loss_mag = F.l1_loss(mag_p, mag_t)
+        loss_mag  = F.l1_loss(mag_p, mag_t)
         edge_mask = (mag_t > mag_t.mean()).float()
         cos_sim   = (gxp * gxt + gyp * gyt) / (mag_p * mag_t + 1e-6)
         loss_dir  = ((1 - cos_sim) * edge_mask).sum() / (edge_mask.sum() + 1e-6)
         return loss_mag + 0.3 * loss_dir
 
 
+# =============================================================================
+# ★ MOD-1 + MOD-2: PerceptualLoss
+#   MOD-1: ImageNet 归一化 → CT 域实测统计（4267 张训练集切片）
+#   MOD-2: 新增 layer4，加权求和
+# =============================================================================
 class PerceptualLoss(nn.Module):
     def __init__(self):
         super().__init__()
         resnet = models.resnet50(
             weights=models.ResNet50_Weights.IMAGENET1K_V1).eval()
+
         self.feats, self.hooks = {}, []
-        for name in ('layer1', 'layer2', 'layer3'):
+        # ★ MOD-2: 新增 layer4
+        for name in ('layer1', 'layer2', 'layer3', 'layer4'):
             h = dict(resnet.named_modules())[name].register_forward_hook(
                 lambda m, i, o, n=name: self.feats.update({n: o}))
             self.hooks.append(h)
+
         dev = 'cuda' if torch.cuda.is_available() else 'cpu'
         self.resnet = resnet.to(dev)
         for p in self.resnet.parameters():
             p.requires_grad_(False)
-        self.layers = ('layer1', 'layer2', 'layer3')
+
+        # ★ MOD-2: 更新 layers 元组
+        self.layers = ('layer1', 'layer2', 'layer3', 'layer4')
+
+        # ★ MOD-2: 各层感知损失权重（layer4 权重低，避免过度语义约束）
+        self.layer_weights = {
+            'layer1': 0.5,
+            'layer2': 1.0,
+            'layer3': 1.0,
+            'layer4': 0.3,
+        }
+        self.weight_sum = sum(self.layer_weights.values())  # 2.8
+
+        # ★ MOD-1: 替换 ImageNet 归一化为 CT 域实测统计
+        # 原 ImageNet: mean=[0.485,0.456,0.406], std=[0.229,0.224,0.225]
+        # CT 域实测（4267张训练集NDCT切片，[0,1]范围）:
+        #   per-slice mean=0.2135, per-slice std=0.1932
         self.register_buffer('mean',
-            torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1))
+            torch.tensor([0.2135, 0.2135, 0.2135]).view(1, 3, 1, 1))
         self.register_buffer('std',
-            torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1))
+            torch.tensor([0.1932, 0.1932, 0.1932]).view(1, 3, 1, 1))
 
     def forward(self, x, y):
         def prep(t):
             t3   = t.float().repeat(1, 3, 1, 1)
             mean = self.mean.to(t3.device)
             std  = self.std.to(t3.device)
+            # 逻辑不变，mean/std 已换为 CT 域值
             return ((t3 + 1) / 2 - mean) / std
+
         self.feats.clear(); self.resnet(prep(x)); xf = self.feats.copy()
         self.feats.clear(); self.resnet(prep(y)); yf = dict(self.feats)
-        return sum(F.mse_loss(xf[l], yf[l]) for l in self.layers) / 3
+
+        # ★ MOD-2: 加权求和替代等权平均
+        loss = sum(
+            self.layer_weights[l] * F.mse_loss(xf[l], yf[l])
+            for l in self.layers
+        ) / self.weight_sum
+        return loss
 
     def __del__(self):
         for h in self.hooks:
@@ -825,43 +954,41 @@ class PerceptualLoss(nn.Module):
 
 
 # =============================================================================
-# CompositeLoss（UPG-5: GradientConsistencyLoss；UPG-7: 动态权重接口）
+# CompositeLoss（固定权重，FIX-9）
+# FIX-6: lg 由外部传入（渐进增加）
 # =============================================================================
 class CompositeLoss(nn.Module):
     def __init__(self, lc=1.0, ls=1.5, lp=0.05, lf=0.15,
                  lw=0.4, ln=0.3, le=0.3, lg=0.0):
         super().__init__()
-        self.charb  = CharbonnierLoss()
-        self.ssim   = SSIMLoss(data_range=2.0, levels=3)
-        self.perc   = PerceptualLoss()
-        self.freq   = FrequencyLoss()
-        self.wav    = HaarWaveletLoss()
-        self.noise  = NoiseAwareLoss()
-        self.edge   = EdgeAwareLoss()
-        self.grad   = GradientConsistencyLoss()
+        self.charb = CharbonnierLoss()
+        self.ssim  = SSIMLoss(data_range=2.0, levels=3)
+        self.perc  = PerceptualLoss()
+        self.freq  = FrequencyLoss(phase_weight=0.1)   # ★ MOD-3
+        self.wav   = HaarWaveletLoss()                  # ★ MOD-4
+        self.noise = NoiseAwareLoss()
+        self.edge  = EdgeAwareLoss()
+        self.grad  = GradientConsistencyLoss()
         self.lc, self.ls, self.lp = lc, ls, lp
         self.lf, self.lw, self.ln = lf, lw, ln
-        self.le, self.lg          = le, lg
+        self.le,  self.lg         = le, lg
 
-    def update_weights(self, lc=None, ls=None, le=None, lg=None):
-        if lc is not None: self.lc = lc
-        if ls is not None: self.ls = ls
-        if le is not None: self.le = le
-        if lg is not None: self.lg = lg
-
-    def forward(self, pred, target, ldct=None):
+    def forward(self, pred, target, ldct=None, lg_override=None):
         lc = self.charb(pred, target)
-        ls = self.ssim(pred, target)
-        lp = self.perc(pred, target)
-        lf = self.freq(pred, target)
-        lw = self.wav(pred, target)
-        le = self.edge(pred, target)
-        lg = self.grad(pred, target)
+        ls = self.ssim(pred,  target)
+        lp = self.perc(pred,  target)
+        lf = self.freq(pred,  target)
+        lw = self.wav(pred,   target)
+        le = self.edge(pred,  target)
+        lg = self.grad(pred,  target)
         ln = self.noise(pred, target, ldct) if ldct is not None \
              else torch.zeros(1, device=pred.device)
+
+        lg_w = lg_override if lg_override is not None else self.lg
+
         total = (self.lc*lc + self.ls*ls + self.lp*lp +
                  self.lf*lf + self.lw*lw + self.ln*ln +
-                 self.le*le + self.lg*lg)
+                 self.le*le + lg_w*lg)
         subs  = dict(charb=lc.item(), ssim=ls.item(), perc=lp.item(),
                      freq=lf.item(),  wav=lw.item(),  edge=le.item(),
                      grad=lg.item(),
@@ -870,21 +997,7 @@ class CompositeLoss(nn.Module):
 
 
 # =============================================================================
-# UPG-7: 动态损失权重调度
-# =============================================================================
-def get_dynamic_loss_weights(epoch, finetune_start=300):
-    if epoch <= 230:
-        return None
-    progress = min((epoch - 200) / max(finetune_start - 200, 1), 1.0)
-    lc = 1.0 - 0.25 * progress
-    ls = 0.8 + 1.0  * progress
-    le = 0.2 + 0.3  * progress
-    lg = 0.0 + 0.3  * progress
-    return dict(lc=lc, ls=ls, le=le, lg=lg)
-
-
-# =============================================================================
-# Dataset（UPG-10: 增强数据增广）
+# Dataset
 # =============================================================================
 class LDCTDataset(Dataset):
     def __init__(self, ldct_root, ndct_root, patients,
@@ -942,19 +1055,16 @@ class LDCTDataset(Dataset):
                 ld = (ld * f).clamp(-1, 1)
                 nd = (nd * f).clamp(-1, 1)
 
-            # UPG-10a: 噪声注入
             if random.random() > 0.8:
                 extra_noise = torch.randn_like(ld) * random.uniform(0.005, 0.02)
                 ld = (ld + extra_noise).clamp(-1, 1)
 
-            # UPG-10b: Gamma 校正
             if random.random() > 0.85:
                 gamma  = random.uniform(0.9, 1.1)
                 ld_01  = ((ld + 1) / 2).clamp(0, 1)
                 ld_01  = torch.pow(ld_01, gamma)
                 ld     = (ld_01 * 2 - 1).clamp(-1, 1)
 
-            # UPG-10c: 局部遮挡
             if random.random() > 0.9:
                 _, h2, w2  = ld.shape
                 mh = random.randint(h2 // 16, h2 // 8)
@@ -968,35 +1078,24 @@ class LDCTDataset(Dataset):
 
 
 # =============================================================================
-# 【单卡版】Batch size — 针对 A100 80GB AMP(fp16) 重新标定
-#   原 DDP 2 卡合计 batch；此处为单卡实际 batch
-#   注：如实际 OOM，可将各档再减半
+# Batch size
 # =============================================================================
 def get_batch_size(patch_size):
-    """
-    A100 80GB 单卡 AMP 推荐 batch size:
-      patch=128 → 48   (显存约 28~34GB)
-      patch=192 → 24   (显存约 32~40GB)
-      patch=256 → 12   (显存约 36~48GB)
-      patch=320 → 6    (显存约 42~56GB)
-      patch=384 → 3    (显存约 48~64GB)
-    若出现 OOM，在启动命令后加 --reduce_batch 标志，各档减半
-    """
     if patch_size <= 128: return 48
     if patch_size <= 192: return 24
     if patch_size <= 256: return 12
     if patch_size <= 320: return 8
-    return 6 # 384
+    return 6
 
 
 # =============================================================================
-# UPG-8: Patch size 调度
+# Patch size 调度（FIX-3）
 # =============================================================================
 def get_patch_size(epoch):
     if epoch <= 20:   return 128
     if epoch <= 60:   return 192
     if epoch <= 120:  return 256
-    if epoch <= 200:  return 320
+    if epoch <= 240:  return 320
     return 384
 
 
@@ -1098,10 +1197,9 @@ def compute_metrics(pred_hu, target_hu):
 
 
 # =============================================================================
-# 显存预检（A100 80GB 阈值）
+# 显存预检
 # =============================================================================
 def vram_check(model, device):
-    # 单卡 A100 80GB；AMP 下峰值留 5GB 余量
     configs = [(128, 8), (192, 4), (256, 2)]
     model.train()
     print("\n[显存预检 — A100 80GB]")
@@ -1111,10 +1209,11 @@ def vram_check(model, device):
             dummy = torch.randn(batch, 1, patch, patch).to(device)
             with torch.amp.autocast('cuda'):
                 out = model(dummy)
+                if isinstance(out, tuple):
+                    out = out[0]
             loss = out.mean()
             loss.backward()
             used = torch.cuda.memory_reserved(device) / 1e9
-            # A100 80GB：<60GB 安全，60~72GB 偏高，>72GB 危险
             status = "✅" if used < 60 else ("⚠️ 偏高" if used < 72 else "❌ 危险")
             print(f"  patch={patch:<4} batch={batch}  峰值≈{used:.1f}GB  {status}")
             del dummy, out, loss
@@ -1147,7 +1246,7 @@ def evaluate(model, loader, device, save_dir,
         ps, ss = compute_metrics(ph, gh)
         psnrs.append(ps); ssims.append(ss)
 
-        if i % 500 == 0:
+        if i % 350 == 0:
             fig, ax = plt.subplots(1, 3, figsize=(15, 5))
             smart_imshow(ax[0], lh, "LDCT")
             smart_imshow(ax[1], ph, f"Denoised\nPSNR:{ps:.2f} dB | SSIM:{ss:.4f}")
@@ -1169,7 +1268,7 @@ def evaluate(model, loader, device, save_dir,
 
     with open(os.path.join(save_dir, f"{tag}_results.txt"),
               'w', encoding='utf-8') as f:
-        f.write(f"=== V5 {tag.upper()}{tta_tag} ===\n\n")
+        f.write(f"=== V5-Fixed-CT {tag.upper()}{tta_tag} ===\n\n")
         f.write(f"PSNR : {avg_p:.2f} ± {std_p:.2f} dB\n")
         f.write(f"SSIM : {avg_s:.4f} ± {std_s:.4f}\n")
         f.write(f"N    : {len(psnrs)}\n")
@@ -1193,7 +1292,7 @@ def plot_history(history, save_dir):
 
 
 # =============================================================================
-# Fine-tune 阶段组件（UPG-12）
+# Fine-tune 阶段组件
 # =============================================================================
 def build_finetune_components(model, device):
     optimizer_ft = optim.AdamW(
@@ -1211,30 +1310,28 @@ def build_finetune_components(model, device):
     criterion_ft = CompositeLoss(
         lc=0.8, ls=2.0, lp=0.05,
         lf=0.05, lw=0.1, ln=0.2,
-        le=0.5, lg=0.4,
+        le=0.5, lg=GRAD_LOSS_MAX,
     ).to(device)
     return optimizer_ft, scheduler_ft, criterion_ft
 
 
 # =============================================================================
-# 【单卡版】主训练函数
+# 主训练函数
 # =============================================================================
 def main():
-    # ── 设备 ──────────────────────────────────────────────────────
     assert torch.cuda.is_available(), "未检测到 CUDA 设备"
     device = torch.device('cuda:0')
 
-    print(f"[V5 单卡版] Device: {device}")
+    print(f"[V5-Fixed-CT] Device: {device}")
     print(f"GPU : {torch.cuda.get_device_name(0)}")
     total_vram = torch.cuda.get_device_properties(0).total_memory / 1e9
     print(f"显存: {total_vram:.1f} GB")
 
     # ── 路径 ──────────────────────────────────────────────────────
     BASE_DIR    = "/home/user/joshua82/LDCT_Project"
-    SAVE_DIR    = f"{BASE_DIR}/output/checkpoints/a100"
+    SAVE_DIR    = f"{BASE_DIR}/output/checkpoints/a101"   # ★ 新目录，避免混淆
     LDCT_ROOT   = f"{BASE_DIR}/dataset/QD301mm"
     NDCT_ROOT   = f"{BASE_DIR}/dataset/FD301mm"
-    # 单卡 I/O 瓶颈更明显，建议 num_workers=8
     NUM_WORKERS = 8
 
     NUM_EPOCHS = FINETUNE_START + FINETUNE_EPOCHS  # 450
@@ -1243,6 +1340,12 @@ def main():
     print(f"  训练集: {TRAIN_PATIENTS}")
     print(f"  验证集: {VAL_PATIENTS}")
     print(f"  测试集: {TEST_PATIENTS}")
+    print(f"\n【本版改动】")
+    print(f"  MOD-1: PerceptualLoss CT 归一化 mean=0.2135 std=0.1932")
+    print(f"  MOD-2: PerceptualLoss 新增 layer4（权重 0.5/1.0/1.0/0.3）")
+    print(f"  MOD-3: FrequencyLoss 相位约束 phase_weight=0.1")
+    print(f"  MOD-4: HaarWaveletLoss 3 级递归分解")
+    print(f"  MOD-5: 辅助头 EdgeAwareLoss（dec3×0.2，dec2×0.1）")
     print(f"\n训练阶段: epoch 1–{FINETUNE_START}（主训练）"
           f" + epoch {FINETUNE_START+1}–{NUM_EPOCHS}（fine-tune）\n")
 
@@ -1254,7 +1357,6 @@ def main():
     test_ds  = LDCTDataset(LDCT_ROOT, NDCT_ROOT, TEST_PATIENTS,
                            mode='test',  patch_size=0)
 
-    # 【单卡版】普通 DataLoader，无 DistributedSampler
     def make_loader(dataset, batch_size, num_workers, shuffle=True):
         return DataLoader(
             dataset, batch_size=batch_size, shuffle=shuffle,
@@ -1274,7 +1376,7 @@ def main():
     print(f"[初始] patch={cur_ps}  batch={cur_batch}")
 
     # ── 模型 ──────────────────────────────────────────────────────
-    model = LDCTDenoiserV5(
+    model = LDCTDenoiserV5Fixed(
         in_ch=1, bc=96, growth=32,
         bot_depth=6, bot_heads=8, ws=8,
         dec_depths=(3, 3, 2, 2),
@@ -1283,16 +1385,17 @@ def main():
     ).to(device)
 
     n_params = sum(p.numel() for p in model.parameters()) / 1e6
-    print(f"[V5] Parameters: {n_params:.1f}M")
+    print(f"[V5-Fixed-CT] Parameters: {n_params:.1f}M")
     vram_check(model, device)
 
     ema = EMA(model, decay=0.9999)
 
-    # ── 主训练阶段优化器（UPG-13: BASE_LR=2e-4, WARMUP=5）──────────
-    BASE_LR  = 2e-4
+    # ── 主训练阶段优化器（FIX-1）─────────────────────────────────
+    BASE_LR  = 1e-4
     WARMUP   = 5
     optimizer = optim.AdamW(model.parameters(), lr=BASE_LR,
-                            weight_decay=5e-5, betas=(0.9, 0.999))
+                            weight_decay=1e-4,
+                            betas=(0.9, 0.999))
 
     def lr_lambda(ep):
         if ep < WARMUP:
@@ -1305,7 +1408,7 @@ def main():
             (WARMUP,  30,  1.00),
             (30,      80,  0.60),
             (85,     150,  0.30),
-            (155, FINETUNE_START, 0.10),
+            (155, FINETUNE_START, 0.20),
         ]
         for s_start, s_end, peak in stages:
             if s_start <= ep < s_end:
@@ -1314,10 +1417,17 @@ def main():
         return 0.02
 
     scheduler = optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
-    criterion = CompositeLoss(lc=1.0, ls=0.8, lp=0.05,
-                              lf=0.1,  lw=0.2, ln=0.4,
-                              le=0.2,  lg=0.0).to(device)
-    scaler    = torch.amp.GradScaler('cuda')
+
+    criterion = CompositeLoss(
+        lc=1.0, ls=0.8, lp=0.05,
+        lf=0.1,  lw=0.2, ln=0.4,
+        le=0.2,  lg=0.0,
+    ).to(device)
+
+    # ★ MOD-5: 辅助头用的 EdgeAwareLoss 实例（复用已有类）
+    edge_criterion = EdgeAwareLoss().to(device)
+
+    scaler = torch.amp.GradScaler('cuda')
 
     os.makedirs(SAVE_DIR, exist_ok=True)
     history      = {'train_loss': []}
@@ -1330,13 +1440,11 @@ def main():
     criterion_ft = None
     in_finetune  = False
 
-    # ── Checkpoint 恢复 ───────────────────────────────────────────
-    def find_best_ckpt(save_dir):
+    # ── Checkpoint 恢复（FIX-8）──────────────────────────────────
+    def find_latest_ckpt(save_dir):
         import glob, re
-        ckpt_files = glob.glob(os.path.join(save_dir, 'ckpt_ep*.pth'))
-        best_files = glob.glob(os.path.join(save_dir, 'best_P*.pth'))
-        all_files = ckpt_files + best_files
-
+        all_files = (glob.glob(os.path.join(save_dir, 'ckpt_ep*.pth')) +
+                     glob.glob(os.path.join(save_dir, 'best_P*.pth')))
         if not all_files:
             return None, 0.0
 
@@ -1348,43 +1456,61 @@ def main():
             m = re.search(r'_P([\d.]+?)(?=_|\.pth)', os.path.basename(path))
             return float(m.group(1)) if m else 0.0
 
-        # 按 epoch 编号取最新，而非按 PSNR
-        latest_path = max(all_files, key=extract_epoch)
-        return latest_path, extract_psnr(latest_path)
+        latest = max(all_files, key=extract_epoch)
+        return latest, extract_psnr(latest)
 
-    ckpt_path, ckpt_psnr = find_best_ckpt(SAVE_DIR)
+    ckpt_path, ckpt_psnr = find_latest_ckpt(SAVE_DIR)
     if ckpt_path is not None:
         print(f"\n[Resume] {os.path.basename(ckpt_path)}  PSNR={ckpt_psnr:.2f}")
-        ckpt = torch.load(ckpt_path, map_location=device)
+        ckpt  = torch.load(ckpt_path, map_location=device)
         state = {k.replace('module.', ''): v for k, v in ckpt['model'].items()}
-        model.load_state_dict(state)
-        if 'ema' in ckpt:
-            ema.shadow.load_state_dict(ckpt['ema'])
-        if 'opt' in ckpt:
-            optimizer.load_state_dict(ckpt['opt'])
-        history = ckpt.get('history', history)
-        best_psnr = ckpt.get('best_psnr', ckpt_psnr)
-        start_epoch = ckpt['epoch'] + 1
-        in_finetune = ckpt.get('in_finetune', False)
 
-        # ── 关键修复：resume 到 fine-tune 阶段时补初始化 ──────────
+        cur_state = model.state_dict()
+        filtered  = {k: v for k, v in state.items() if k in cur_state
+                     and cur_state[k].shape == v.shape}
+        missing   = [k for k in cur_state if k not in filtered]
+        if missing:
+            print(f"  [Resume] 新增层（随机初始化）: "
+                  f"{missing[:5]}{'...' if len(missing)>5 else ''}")
+        cur_state.update(filtered)
+        model.load_state_dict(cur_state)
+
+        if 'ema' in ckpt:
+            ema_state = ema.shadow.state_dict()
+            filtered_ema = {k: v for k, v in ckpt['ema'].items()
+                            if k in ema_state and ema_state[k].shape == v.shape}
+            ema_state.update(filtered_ema)
+            ema.shadow.load_state_dict(ema_state)
+
+        history     = ckpt.get('history', history)
+        best_psnr   = ckpt.get('best_psnr', ckpt_psnr)
+        start_epoch = ckpt['epoch'] + 1
+
+        in_finetune = ckpt.get('in_finetune', False)
         if in_finetune:
+            print(f"  [Resume] 检测到 fine-tune 阶段 checkpoint，恢复 fine-tune 组件")
             optimizer_ft, scheduler_ft, criterion_ft = \
                 build_finetune_components(model, device)
-            # 恢复 fine-tune optimizer 状态
+            ema.decay = 0.99995
             if 'opt' in ckpt:
                 try:
                     optimizer_ft.load_state_dict(ckpt['opt'])
+                    print(f"  [Resume] optimizer_ft 状态已恢复")
                 except Exception as e:
-                    print(f"  [警告] fine-tune optimizer 状态恢复失败，使用初始值: {e}")
-            # 恢复 scheduler 状态
+                    print(f"  [Resume] optimizer_ft 状态不兼容，重新初始化: {e}")
             if 'sched' in ckpt:
                 try:
                     scheduler_ft.load_state_dict(ckpt['sched'])
+                    print(f"  [Resume] scheduler_ft 状态已恢复")
                 except Exception as e:
-                    print(f"  [警告] fine-tune scheduler 状态恢复失败，使用初始值: {e}")
-            ema.decay = 0.99995
-            print(f"  [Resume] fine-tune 阶段组件已初始化  EMA decay={ema.decay}")
+                    print(f"  [Resume] scheduler_ft 状态不兼容，重新初始化: {e}")
+        else:
+            if 'opt' in ckpt:
+                try:
+                    optimizer.load_state_dict(ckpt['opt'])
+                    print(f"  [Resume] optimizer 状态已恢复")
+                except Exception as e:
+                    print(f"  [Resume] optimizer 状态不兼容，重新初始化: {e}")
 
         print(f"[Resume] 从 epoch {ckpt['epoch']} 恢复，"
               f"将从 epoch {start_epoch} 继续\n")
@@ -1397,20 +1523,17 @@ def main():
         # ----------------------------------------------------------
         # 切换至 fine-tune 阶段
         # ----------------------------------------------------------
-        if epoch > FINETUNE_START and not in_finetune:
+        if epoch == FINETUNE_START + 1 and not in_finetune:
             in_finetune  = True
-            # 【单卡版】直接传 model，无需 model_ddp
             optimizer_ft, scheduler_ft, criterion_ft = \
                 build_finetune_components(model, device)
-            scaler = torch.amp.GradScaler('cuda')
-            ema.decay = 0.99995   # UPG-9
+            scaler  = torch.amp.GradScaler('cuda')
+            ema.decay = 0.99995
             print(f"\n{'='*60}")
-            print(f"[V5-OPT] 切换至 Fine-tune 阶段 (epoch {epoch})")
+            print(f"[V5-Fixed-CT] 切换至 Fine-tune 阶段 (epoch {epoch})")
             print(f"  optimizer : AdamW  lr={FINETUNE_LR}  wd=0")
             print(f"  scheduler : CosineAnnealingWarmRestarts "
                   f"T_0={FINETUNE_T0}  T_mult={FINETUNE_T_MULT}")
-            print(f"  criterion : lc=0.8 ls=2.0 lp=0.05 "
-                  f"lf=0.05 lw=0.1 ln=0.2 le=0.5 lg=0.4")
             print(f"  EMA decay : {ema.decay}")
             print(f"{'='*60}\n")
 
@@ -1418,18 +1541,10 @@ def main():
         cur_scheduler = scheduler_ft if in_finetune else scheduler
         cur_criterion = criterion_ft if in_finetune else criterion
 
-        # ----------------------------------------------------------
-        # UPG-7: 动态损失权重调度
-        # ----------------------------------------------------------
-        if not in_finetune and epoch % 10 == 0:
-            dw = get_dynamic_loss_weights(epoch, FINETUNE_START)
-            if dw is not None:
-                cur_criterion.update_weights(**dw)
-                print(f"  [DynLoss] ep{epoch}  "
-                      + "  ".join(f"{k}:{v:.3f}" for k,v in dw.items()))
+        lg_weight = get_grad_loss_weight(epoch) if not in_finetune else None
 
         # ----------------------------------------------------------
-        # UPG-8: patch size / batch size 切换
+        # Patch size / batch size 切换
         # ----------------------------------------------------------
         if in_finetune:
             target_ps    = 256
@@ -1456,16 +1571,29 @@ def main():
             cur_optimizer.zero_grad(set_to_none=True)
 
             with torch.amp.autocast('cuda'):
-                pred       = model(ldct)
-                loss, subs = cur_criterion(pred, ndct, ldct)
+                outputs = model(ldct)
+                main_pred, aux3_pred, aux2_pred = outputs
+
+                # 主 loss
+                loss_main, subs = cur_criterion(main_pred, ndct, ldct,
+                                                lg_override=lg_weight)
+
+                # ★ MOD-5: 辅助头 loss 加入 EdgeAwareLoss
+                loss_aux3 = (CharbonnierLoss()(aux3_pred, ndct) +
+                             0.5 * SSIMLoss()(aux3_pred, ndct) +
+                             0.2 * edge_criterion(aux3_pred, ndct))   # ★ MOD-5
+
+                loss_aux2 = (CharbonnierLoss()(aux2_pred, ndct) +
+                             0.5 * SSIMLoss()(aux2_pred, ndct) +
+                             0.1 * edge_criterion(aux2_pred, ndct))   # ★ MOD-5
+
+                loss = loss_main + 0.3 * loss_aux3 + 0.15 * loss_aux2
 
             scaler.scale(loss).backward()
             scaler.unscale_(cur_optimizer)
             torch.nn.utils.clip_grad_norm_(model.parameters(), 0.5)
             scaler.step(cur_optimizer)
             scaler.update()
-
-            # 【单卡版】无需 is_main guard，直接更新 EMA
             ema.update(model)
 
             total += loss.item()
@@ -1497,8 +1625,9 @@ def main():
             if bi % 200 == 0:
                 mem = torch.cuda.memory_reserved(device) / 1e9
                 sub_str = "  ".join(f"{k}:{v:.4f}" for k, v in subs.items())
+                lg_info = f"  lg_w:{lg_weight:.3f}" if lg_weight is not None else ""
                 print(f"  ep{epoch} [{bi}/{len(train_loader)}]  "
-                      f"loss:{loss.item():.4f}  {sub_str}  VRAM:{mem:.1f}GB")
+                      f"loss:{loss.item():.4f}  {sub_str}{lg_info}  VRAM:{mem:.1f}GB")
 
         avg_loss = total / len(train_loader)
         history['train_loss'].append(avg_loss)
@@ -1508,8 +1637,8 @@ def main():
 
         cur_scheduler.step()
 
-        # ── 验证 & 保存 ───────────────────────────────────────────
-        if epoch % 350 == 0:
+        # ── 验证（FIX-2: 每 25 epoch）────────────────────────────
+        if epoch % 25 == 0:
             ema.eval()
             use_tta_eval = in_finetune
             avg_p, avg_s = evaluate(
@@ -1534,8 +1663,7 @@ def main():
             torch.save(save_data, ckpt_save_path)
             recent_ckpts.append(ckpt_save_path)
 
-            # 只保留最近 2 个普通 checkpoint
-            while len(recent_ckpts) > 2:
+            while len(recent_ckpts) > 3:
                 oldest = recent_ckpts.pop(0)
                 if os.path.exists(oldest) and 'best' not in oldest:
                     os.remove(oldest)
@@ -1566,10 +1694,9 @@ def main():
 
 
 # =============================================================================
-# 单卡直接 python 启动（无需 torchrun）
+# 启动入口
 # =============================================================================
 if __name__ == '__main__':
     assert torch.cuda.is_available(), "需要至少 1 张 GPU"
-    assert torch.cuda.device_count() >= 1, "未检测到 GPU"
-    print(f"[V5 单卡版] 检测到 {torch.cuda.device_count()} 张 GPU，使用 cuda:0")
+    print(f"[V5-Fixed-CT] 检测到 {torch.cuda.device_count()} 张 GPU，使用 cuda:0")
     main()

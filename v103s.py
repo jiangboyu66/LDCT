@@ -33,29 +33,6 @@
 
     数据集划分（10个患者）:
       4-Fold 划分见 FOLDS 列表（每折独立 train/val/test）
-
-    ==========================================================================
-    V5 补丁清单（本次改动，基于评测/代码审阅意见）:
-      BUGFIX-A  resume 到 fine-tune 分界点时 optimizer_ft 未初始化导致的 AttributeError
-      BUGFIX-B  resume 时不恢复 scheduler state_dict，LR 被打回 warmup
-      BUGFIX-C  EMA decay 过大 (0.9999) 导致有效窗口横跨多个 patch-size 阶段，
-                改为 warmup 式 decay 且窗口收紧；每次验证同时评测 EMA 和裸模型，取较优者
-      FEAT-1    2.5D 输入：in_ch 可配置为奇数(3/5/7)，Dataset 按窗口堆叠相邻切片，
-                target 仍只用中心切片；MultiScaleHead 相应只取中心通道做残差连接
-      FEAT-2    下采样 MaxPool2d(2) → PixelUnshuffle(2) + 1x1 conv（信息无损）
-      FEAT-3    MultiScaleHead 最后一层 zero-init，训练起点即为恒等映射
-      FEAT-4    Fine-tune 阶段损失换成几乎纯 MSE（lc 权重对应 L2，其余压到接近 0）
-                注：Charbonnier 在 eps→0 时逼近 L1(条件中位数)，这里改为可选的 MSE 分支
-      FEAT-5    推理拼接：中心裁剪硬拼接 → 二维高斯权重加权拼接，消除接缝台阶
-      FEAT-6    SWA：fine-tune 阶段最后 N 个 checkpoint 权重做算术平均
-      FEAT-7    去掉 drop/attn_drop（默认置 0），weight decay 按参数维度分组
-                （LayerNorm/GroupNorm 的 weight、pos、rpb 不做 weight decay）
-      FEAT-8    SSIMLoss 方差项 clamp(min=0)，避免 fp16 下负方差
-      NOTE      本文档一开头讨论的 "43→47" 指标口径问题（data_range 2500 vs 4096，
-                SSIM 窗口/高斯权重）不是代码 bug，是评测协议选择，不在此脚本中擅自更改
-                data_range，以免和你已有的历史结果不可比。如需切换口径，请显式修改
-                compute_metrics() 里的 data_range，并同步改 Dataset 的归一化范围。
-    ==========================================================================
 """
 
 import os
@@ -110,18 +87,6 @@ FINETUNE_ETA_MIN = 1e-7
 FINETUNE_T0 = 20
 FINETUNE_T_MULT = 2
 
-# =============================================================================
-# FEAT-1: 2.5D 输入配置
-# =============================================================================
-# in_ch 必须是奇数：中心切片 + 前后各 (in_ch-1)//2 张相邻切片
-# 设为 1 即退化为原始的纯 2D 输入
-IN_CH = 3
-
-# =============================================================================
-# FEAT-6: SWA 配置
-# =============================================================================
-SWA_LAST_N = 6  # fine-tune 阶段取最后 N 个 ckpt 做权重平均
-
 
 # =============================================================================
 # 工具函数
@@ -170,62 +135,23 @@ def smart_imshow(ax, img_hu, title=''):
 
 
 # =============================================================================
-# EMA  (BUGFIX-C: warmup decay + 更紧的有效窗口)
+# EMA
 # =============================================================================
 class EMA:
-    """
-    decay 不再是固定 0.9999（有效窗口 1/(1-decay)=10000 步，会跨越多个
-    patch-size 训练阶段，且早期残留初始化权重）。改为 warmup 式 decay：
-    step 越小，d 越接近 (1+step)/(10+step)，随训练推进才逐渐逼近 self.decay 的上限。
-    同时把上限从 0.9999 降到 0.999（有效窗口约 1000 步，量级与一个 epoch 的
-    迭代数相当），避免跨阶段平均带来的偏差。
-    """
-    def __init__(self, model, decay=0.999):
+    def __init__(self, model, decay=0.9999):
         self.decay = decay
-        self.step = 0
         self.shadow = deepcopy(model).eval()
         for p in self.shadow.parameters():
             p.requires_grad_(False)
 
     @torch.no_grad()
     def update(self, model):
-        self.step += 1
-        d = min(self.decay, (1 + self.step) / (10 + self.step))
         for s, m in zip(self.shadow.parameters(), model.parameters()):
-            s.data.mul_(d).add_(m.data, alpha=1 - d)
+            s.data.mul_(self.decay).add_(m.data, alpha=1 - self.decay)
 
     def eval(self):
         self.shadow.eval()
         return self.shadow
-
-    def state_dict_step(self):
-        return {'decay': self.decay, 'step': self.step}
-
-    def load_step(self, d):
-        if d is None:
-            return
-        self.decay = d.get('decay', self.decay)
-        self.step = d.get('step', self.step)
-
-
-# =============================================================================
-# FEAT-2: PixelUnshuffle 下采样（替代 MaxPool2d，信息无损）
-# =============================================================================
-class Down(nn.Module):
-    """
-    space-to-depth 下采样：把 2x2 空间块搬到通道维，再用 1x1 conv 投影回
-    原通道数。相比 MaxPool2d(2)，不丢弃任何像素信息，没有 aliasing，
-    对去噪这种高频敏感任务更友好。
-    """
-    def __init__(self, ch):
-        super().__init__()
-        self.op = nn.Sequential(
-            nn.PixelUnshuffle(2),
-            nn.Conv2d(ch * 4, ch, 1, bias=False),
-        )
-
-    def forward(self, x):
-        return self.op(x)
 
 
 # =============================================================================
@@ -270,30 +196,25 @@ class RRDB(nn.Module):
 
 
 class RRDBEncoder(nn.Module):
-    """
-    FEAT-2: down1~down4 由 MaxPool2d(2) 改为 Down (PixelUnshuffle+1x1conv)。
-    in_ch 现在可以是 2.5D 的堆叠通道数 (FEAT-1)，与原始网络结构无耦合，
-    因为 stem 的第一层 Conv2d(in_ch, bc, ...) 本来就支持任意输入通道。
-    """
     def __init__(self, in_ch=1, bc=88, growth=32):
         super().__init__()
         self.stem = nn.Sequential(
             nn.Conv2d(in_ch, bc, 3, padding=1, bias=False),
             GN(bc), nn.GELU())
         self.enc1 = nn.Sequential(RRDB(bc, growth), RRDB(bc, growth))
-        self.down1 = Down(bc)
+        self.down1 = nn.MaxPool2d(2)
         self.enc2 = nn.Sequential(
             nn.Conv2d(bc, bc * 2, 1, bias=False), GN(bc * 2), nn.GELU(),
             RRDB(bc * 2, growth), RRDB(bc * 2, growth))
-        self.down2 = Down(bc * 2)
+        self.down2 = nn.MaxPool2d(2)
         self.enc3 = nn.Sequential(
             nn.Conv2d(bc * 2, bc * 4, 1, bias=False), GN(bc * 4), nn.GELU(),
             RRDB(bc * 4, growth), RRDB(bc * 4, growth))
-        self.down3 = Down(bc * 4)
+        self.down3 = nn.MaxPool2d(2)
         self.enc4 = nn.Sequential(
             nn.Conv2d(bc * 4, bc * 8, 1, bias=False), GN(bc * 8), nn.GELU(),
             RRDB(bc * 8, growth), RRDB(bc * 8, growth))
-        self.down4 = Down(bc * 8)
+        self.down4 = nn.MaxPool2d(2)
 
     def forward(self, x):
         e1 = self.enc1(self.stem(x))
@@ -616,8 +537,6 @@ class DecoderStage(nn.Module):
 
 # =============================================================================
 # MultiScaleHead
-#   FEAT-1: 2.5D 输入下，x_in 有多个通道，残差连接/detail 分支只用中心通道
-#   FEAT-3: main / detail 最后一层 zero-init，训练起点为恒等映射
 # =============================================================================
 class MultiScaleHead(nn.Module):
     def __init__(self, dim, in_ch=1):
@@ -626,24 +545,19 @@ class MultiScaleHead(nn.Module):
         self.main = nn.Sequential(
             nn.Conv2d(dim, dim, 3, padding=1, groups=dim, bias=False),
             nn.Conv2d(dim, dim // 2, 1, bias=False), nn.GELU(),
-            nn.Conv2d(dim // 2, 1, 1))
+            nn.Conv2d(dim // 2, in_ch, 1))
         self.detail = nn.Sequential(
-            nn.Conv2d(1, 32, 3, padding=1, bias=False), nn.GELU(),
-            nn.Conv2d(32, 1, 3, padding=1))
+            nn.Conv2d(in_ch, 32, 3, padding=1, bias=False), nn.GELU(),
+            nn.Conv2d(32, in_ch, 3, padding=1))
         self.alpha = nn.Parameter(torch.tensor(0.1))
 
     def forward(self, tokens, H, W, x_in):
         B, L, C = tokens.shape
         feat = self.norm(tokens).transpose(1, 2).view(B, C, H, W)
         main = self.main(feat)
-
-        # FEAT-1: x_in 可能是 2.5D 堆叠的多通道输入，残差/细节分支只取中心切片
-        c = x_in.shape[1]
-        x_c = x_in[:, c // 2: c // 2 + 1]
-
-        lp = F.avg_pool2d(x_c, 3, stride=1, padding=1)
-        detail = self.detail(x_c - lp)
-        return (x_c + main + self.alpha.clamp(0, 1) * detail).clamp(-1., 1.)
+        lp = F.avg_pool2d(x_in, 3, stride=1, padding=1)
+        detail = self.detail(x_in - lp)
+        return (x_in + main + self.alpha.clamp(0, 1) * detail).clamp(-1., 1.)
 
 
 # =============================================================================
@@ -668,9 +582,7 @@ class LDCTDenoiserV4(nn.Module):
                                  ws, dec_depths[2], drop, attn_drop)
         self.dec1 = DecoderStage(bc, bc, bc, safe_heads(bc),
                                  ws, dec_depths[3], drop, attn_drop)
-        # head 的 in_ch 固定为 1（残差连接只作用于中心切片），与编码器的
-        # in_ch（可能 > 1，用于 2.5D）解耦
-        self.head = MultiScaleHead(bc, in_ch=1)
+        self.head = MultiScaleHead(bc, in_ch)
         self._init_weights()
 
     def _init_weights(self):
@@ -684,13 +596,6 @@ class LDCTDenoiserV4(nn.Module):
             elif isinstance(m, nn.Conv2d):
                 nn.init.kaiming_normal_(m.weight, mode='fan_out')
                 if m.bias is not None: nn.init.zeros_(m.bias)
-
-        # FEAT-3: head 最后一层 zero-init，让模型一开始就输出恒等映射（残差=0），
-        # 避免训练初期残差幅度过大、模型要先"爬回"恒等映射再学去噪
-        nn.init.zeros_(self.head.main[-1].weight)
-        nn.init.zeros_(self.head.main[-1].bias)
-        nn.init.zeros_(self.head.detail[-1].weight)
-        nn.init.zeros_(self.head.detail[-1].bias)
 
     def forward(self, x):
         B, C, H, W = x.shape
@@ -726,9 +631,8 @@ class SSIMLoss(nn.Module):
         w = self.win.to(x.device, x.dtype)
         mx = F.conv2d(x, w, padding=pad)
         my = F.conv2d(y, w, padding=pad)
-        # FEAT-8: 方差项 clamp(min=0)，避免 fp16 下减法造成的负方差
-        mxx = (F.conv2d(x * x, w, padding=pad) - mx ** 2).clamp(min=0)
-        myy = (F.conv2d(y * y, w, padding=pad) - my ** 2).clamp(min=0)
+        mxx = F.conv2d(x * x, w, padding=pad) - mx ** 2
+        myy = F.conv2d(y * y, w, padding=pad) - my ** 2
         mxy = F.conv2d(x * y, w, padding=pad) - mx * my
         return ((2 * mx * my + C1) * (2 * mxy + C2) /
                 ((mx ** 2 + my ** 2 + C1) * (mxx + myy + C2))).mean()
@@ -855,16 +759,7 @@ class PerceptualLoss(nn.Module):
 
 
 class CompositeLoss(nn.Module):
-    """
-    FEAT-4: 新增 lmse 权重（纯 MSE 分支），用于 fine-tune 阶段"换估计量"。
-    PSNR 是 MSE 的单调函数，MSE 损失的最优解是条件均值 E[NDCT|LDCT]；
-    Charbonnier 在小 eps 下逼近 L1，收敛到条件中位数；perceptual/edge 则会
-    主动往输出里加不可预测的高频，这两者对 PSNR 是纯负贡献。
-    lmse 默认 0，不影响主训练阶段；fine-tune 阶段通过 build_finetune_components
-    把 lmse 设为主导、其余压到接近 0。
-    """
-    def __init__(self, lc=1.0, ls=1.5, lp=0.05, lf=0.15, lw=0.4, ln=0.3, le=0.3,
-                 lmse=0.0):
+    def __init__(self, lc=1.0, ls=1.5, lp=0.05, lf=0.15, lw=0.4, ln=0.3, le=0.3):
         super().__init__()
         self.charb = CharbonnierLoss()
         self.ssim = SSIMLoss(data_range=2.0, levels=3)
@@ -876,47 +771,30 @@ class CompositeLoss(nn.Module):
         self.lc, self.ls, self.lp = lc, ls, lp
         self.lf, self.lw, self.ln = lf, lw, ln
         self.le = le
-        self.lmse = lmse
 
     def forward(self, pred, target, ldct=None):
         lc = self.charb(pred, target)
         ls = self.ssim(pred, target)
-        lp = self.perc(pred, target) if self.lp > 0 else torch.zeros(1, device=pred.device)
-        lf = self.freq(pred, target) if self.lf > 0 else torch.zeros(1, device=pred.device)
-        lw = self.wav(pred, target) if self.lw > 0 else torch.zeros(1, device=pred.device)
-        le = self.edge(pred, target) if self.le > 0 else torch.zeros(1, device=pred.device)
-        ln = self.noise(pred, target, ldct) if (ldct is not None and self.ln > 0) \
+        lp = self.perc(pred, target)
+        lf = self.freq(pred, target)
+        lw = self.wav(pred, target)
+        le = self.edge(pred, target)
+        ln = self.noise(pred, target, ldct) if ldct is not None \
             else torch.zeros(1, device=pred.device)
-        lmse = F.mse_loss(pred, target) if self.lmse > 0 else torch.zeros(1, device=pred.device)
-
         total = (self.lc * lc + self.ls * ls + self.lp * lp +
-                 self.lf * lf + self.lw * lw + self.ln * ln + self.le * le +
-                 self.lmse * lmse)
-        subs = dict(charb=lc.item(), ssim=ls.item(),
-                    perc=lp.item() if torch.is_tensor(lp) else lp,
-                    freq=lf.item() if torch.is_tensor(lf) else lf,
-                    wav=lw.item() if torch.is_tensor(lw) else lw,
-                    edge=le.item() if torch.is_tensor(le) else le,
-                    noise=ln.item() if torch.is_tensor(ln) else ln,
-                    mse=lmse.item() if torch.is_tensor(lmse) else lmse)
+                 self.lf * lf + self.lw * lw + self.ln * ln + self.le * le)
+        subs = dict(charb=lc.item(), ssim=ls.item(), perc=lp.item(),
+                    freq=lf.item(), wav=lw.item(), edge=le.item(),
+                    noise=ln.item() if ldct is not None else 0.)
         return total, subs
 
 
 # =============================================================================
 # Dataset
-#   FEAT-1: 2.5D 输入。窗口大小由 in_ch 决定（必须是奇数）。
-#   按患者分组、按文件名排序后取滑动窗口，边界用 clamp（重复边界切片）。
-#   target 依然只是中心切片的 NDCT。
 # =============================================================================
 class LDCTDataset(Dataset):
-    def __init__(self, ldct_root, ndct_root, patients, mode='train',
-                 patch_size=128, in_ch=1):
-        assert in_ch % 2 == 1, "in_ch (2.5D 窗口) 必须是奇数"
-        self.in_ch = in_ch
-        self.half = in_ch // 2
-
-        # samples: 每个元素是 (ld_path_list[in_ch], nd_center_path)
-        self.samples = []
+    def __init__(self, ldct_root, ndct_root, patients, mode='train', patch_size=128):
+        self.pairs = []
         avail = []
         for p in patients:
             ld = os.path.join(ldct_root, p)
@@ -927,43 +805,28 @@ class LDCTDataset(Dataset):
             avail.append(p)
             lf = sorted(f for f in os.listdir(ld) if f.endswith('.npy'))
             nf = sorted(f for f in os.listdir(nd) if f.endswith('.npy'))
-            n = min(len(lf), len(nf))
-            ld_paths = [os.path.join(ld, lf[i]) for i in range(n)]
-            nd_paths = [os.path.join(nd, nf[i]) for i in range(n)]
-
-            for i in range(n):
-                # 边界 clamp：窗口越界时重复首/尾切片
-                idxs = [min(max(i + off, 0), n - 1)
-                        for off in range(-self.half, self.half + 1)]
-                window_ld_paths = [ld_paths[j] for j in idxs]
-                self.samples.append((window_ld_paths, nd_paths[i]))
+            for i in range(min(len(lf), len(nf))):
+                self.pairs.append((os.path.join(ld, lf[i]),
+                                   os.path.join(nd, nf[i])))
 
         self.patch_size = patch_size
         self.is_train = (mode == 'train')
-        print(f"[{mode.upper()}] 患者={avail}  共 {len(self.samples)} 个切片对  "
-              f"(2.5D in_ch={in_ch})")
+        print(f"[{mode.upper()}] 患者={avail}  共 {len(self.pairs)} 个切片对")
 
     def set_patch_size(self, ps):
         self.patch_size = ps
 
     def __len__(self):
-        return len(self.samples)
-
-    @staticmethod
-    def _load_norm(path):
-        arr = np.clip(np.load(path).astype(np.float32), -1000, 1500)
-        arr = (arr + 1000) / 2500 * 2 - 1
-        return arr
+        return len(self.pairs)
 
     def __getitem__(self, idx):
-        ld_paths, nd_path = self.samples[idx]
-
-        ld_slices = [self._load_norm(p) for p in ld_paths]
-        ld = np.stack(ld_slices, axis=0)          # (in_ch, H, W)
-        nd = self._load_norm(nd_path)[None]        # (1, H, W)  中心切片 target
-
-        ld = torch.from_numpy(ld)
-        nd = torch.from_numpy(nd)
+        lp, np_ = self.pairs[idx]
+        ld = np.clip(np.load(lp).astype(np.float32), -1000, 1500)
+        nd = np.clip(np.load(np_).astype(np.float32), -1000, 1500)
+        ld = (ld + 1000) / 2500 * 2 - 1
+        nd = (nd + 1000) / 2500 * 2 - 1
+        ld = torch.from_numpy(ld)[None]
+        nd = torch.from_numpy(nd)[None]
 
         if self.is_train and self.patch_size > 0:
             _, h, w = ld.shape
@@ -1008,8 +871,6 @@ def make_loader(dataset, batch_size, num_workers, shuffle=True):
 
 # =============================================================================
 # OPT-1: TTA Inference
-#   注意：2.5D 输入下，翻转/旋转是对空间维 (H, W) 做的，通道维（相邻切片）
-#   不受影响，几何变换在通道维上是恒等的，因此 tta 的 fwd/inv 实现无需改动。
 # =============================================================================
 @torch.no_grad()
 def tta_inference(model, img, tile=256, overlap=64, device='cuda'):
@@ -1044,40 +905,10 @@ def tta_inference(model, img, tile=256, overlap=64, device='cuda'):
 
 
 # =============================================================================
-# FEAT-5: 二维高斯权重拼接（替代硬中心裁剪拼接）
-# =============================================================================
-_GAUSSIAN_WEIGHT_CACHE = {}
-
-
-def _gaussian_tile_weight(tile, device, dtype=torch.float32, sigma_scale=0.125):
-    """
-    生成 tile x tile 的二维高斯权重图，中心权重最高、边缘权重趋近于 0，
-    用于 patch 拼接时的加权平均，消除硬裁剪拼接留下的接缝台阶。
-    结果按 cache key (tile, sigma_scale) 缓存，避免重复计算。
-    """
-    key = (tile, sigma_scale)
-    if key not in _GAUSSIAN_WEIGHT_CACHE:
-        coords = torch.arange(tile, dtype=torch.float32) - (tile - 1) / 2
-        sigma = tile * sigma_scale
-        g1d = torch.exp(-(coords ** 2) / (2 * sigma ** 2))
-        w2d = g1d.outer(g1d)
-        w2d = w2d / w2d.max().clamp(min=1e-8)  # 归一化到 [~0, 1]，中心恰为 1
-        w2d = w2d.clamp(min=1e-3)  # 避免权重恰好为 0 造成的除零/信息丢失
-        _GAUSSIAN_WEIGHT_CACHE[key] = w2d
-    return _GAUSSIAN_WEIGHT_CACHE[key].to(device=device, dtype=dtype)
-
-
-# =============================================================================
-# Patch Inference  (FEAT-5: 高斯加权拼接)
+# Patch Inference
 # =============================================================================
 @torch.no_grad()
-def patch_inference(model, img, tile=256, overlap=64, device='cuda',
-                     blend='gaussian'):
-    """
-    blend='gaussian' (默认): 每个 tile 乘以二维高斯权重后累加，重叠区域按权重
-        归一化平均，边缘过渡平滑，无接缝台阶。
-    blend='hard': 保留原始的中心裁剪硬拼接逻辑，便于对比/回退。
-    """
+def patch_inference(model, img, tile=256, overlap=64, device='cuda'):
     _, C, H, W = img.shape
     tile = (tile // 16) * 16
     margin = overlap // 2
@@ -1088,41 +919,33 @@ def patch_inference(model, img, tile=256, overlap=64, device='cuda',
     img_p = F.pad(img, (0, pad_w, 0, pad_h), mode='reflect')
     oH, oW = img_p.shape[2], img_p.shape[3]
 
-    # 模型输出恒为单通道（中心切片的去噪结果），累加/计数张量用输出通道数 1
-    out_full = torch.zeros(1, 1, oH, oW)
-    cnt_full = torch.zeros(1, 1, oH, oW)
+    out_full = torch.zeros(1, C, oH, oW)
+    cnt_full = torch.zeros(1, C, oH, oW)
 
     ys = list(range(0, max(oH - tile, 0) + 1, step)) or [0]
     xs = list(range(0, max(oW - tile, 0) + 1, step)) or [0]
     if ys[-1] + tile < oH: ys.append(oH - tile)
     if xs[-1] + tile < oW: xs.append(oW - tile)
 
-    if blend == 'gaussian':
-        w2d = _gaussian_tile_weight(tile, device='cpu').view(1, 1, tile, tile)
-
     for y in ys:
         for x in xs:
             patch = img_p[:, :, y:y + tile, x:x + tile].to(device)
             pred = model(patch).cpu()
 
-            if blend == 'gaussian':
-                out_full[:, :, y:y + tile, x:x + tile] += pred * w2d
-                cnt_full[:, :, y:y + tile, x:x + tile] += w2d
-            else:
-                py1 = margin if y > 0 else 0
-                py2 = tile - margin if y + tile < oH else tile
-                px1 = margin if x > 0 else 0
-                px2 = tile - margin if x + tile < oW else tile
+            py1 = margin if y > 0 else 0
+            py2 = tile - margin if y + tile < oH else tile
+            px1 = margin if x > 0 else 0
+            px2 = tile - margin if x + tile < oW else tile
 
-                cy1, cy2 = y + py1, y + py2
-                cx1, cx2 = x + px1, x + px2
+            cy1, cy2 = y + py1, y + py2
+            cx1, cx2 = x + px1, x + px2
 
-                out_full[:, :, cy1:cy2, cx1:cx2] += pred[:, :, py1:py2, px1:px2]
-                cnt_full[:, :, cy1:cy2, cx1:cx2] += 1.0
+            out_full[:, :, cy1:cy2, cx1:cx2] += pred[:, :, py1:py2, px1:px2]
+            cnt_full[:, :, cy1:cy2, cx1:cx2] += 1.0
 
-    out_full = out_full / cnt_full.clamp(min=1e-6)
+    out_full = out_full / cnt_full.clamp(min=1)
 
-    mask = (cnt_full < 1e-6)
+    mask = (cnt_full == 0)
     if mask.any():
         fallback = model(img_p.to(device)).cpu()
         out_full[mask] = fallback[mask]
@@ -1157,14 +980,14 @@ def get_patch_size(epoch):
 # =============================================================================
 # 显存预检
 # =============================================================================
-def vram_check(model, device, in_ch=1):
+def vram_check(model, device):
     configs = [(128, 4), (192, 3), (256, 2)]
     model.train()
     print("\n[显存预检]")
     for patch, batch in configs:
         torch.cuda.empty_cache()
         try:
-            dummy = torch.randn(batch, in_ch, patch, patch).to(device)
+            dummy = torch.randn(batch, 1, patch, patch).to(device)
             with torch.amp.autocast('cuda'):
                 out = model(dummy)
             loss = out.mean()
@@ -1204,9 +1027,7 @@ def evaluate(model, loader, device, save_dir,
         pred = infer_fn(model, ldct, tile, overlap, device)
         ph = to_hu(pred[0, 0])
         gh = to_hu(ndct[0, 0])
-        # 2.5D 输入下 ldct 有多个通道，可视化/统计仍只看中心切片
-        lc = ldct.shape[1] // 2
-        lh = to_hu(ldct[0, lc])
+        lh = to_hu(ldct[0, 0])
         ps, ss, ms = compute_metrics(ph, gh)
         psnrs.append(ps)
         ssims.append(ss)
@@ -1280,32 +1101,12 @@ def plot_history(history, save_dir):
 
 # =============================================================================
 # OPT-2: Fine-tune 阶段优化器 / scheduler / criterion
-#   FEAT-4: criterion 换成几乎纯 MSE（PSNR 是 MSE 的单调函数），把 charb/
-#           ssim/perc/freq/wav/noise 压到接近 0，edge 也不再作为主项。
-#           lc 保留一点点 Charbonnier 作为数值稳定的正则，主导项是 lmse。
-#   FEAT-7: fine-tune 阶段同样使用分组 weight decay（见 build_param_groups）。
 # =============================================================================
-def build_param_groups(model, weight_decay=5e-5):
-    """
-    FEAT-7: 只对 ndim > 1 的参数（conv/linear 权重）施加 weight decay，
-    LayerNorm/GroupNorm 的 weight、bias，以及网络里所有 1 维参数（包括
-    named 里含 'rpb' 或 'pos' 的相对位置偏置/位置编码）不做 weight decay。
-    """
-    decay_p = [p for n, p in model.named_parameters()
-               if p.requires_grad and p.ndim > 1
-               and 'rpb' not in n and 'pos' not in n]
-    no_decay = [p for n, p in model.named_parameters()
-                if p.requires_grad and (p.ndim <= 1 or 'rpb' in n or 'pos' in n)]
-    return [
-        {'params': decay_p, 'weight_decay': weight_decay},
-        {'params': no_decay, 'weight_decay': 0.},
-    ]
-
-
 def build_finetune_components(model, device):
     optimizer_ft = optim.AdamW(
-        build_param_groups(model, weight_decay=0.),
+        model.parameters(),
         lr=FINETUNE_LR,
+        weight_decay=0,
         betas=(0.9, 0.999),
     )
     scheduler_ft = optim.lr_scheduler.CosineAnnealingWarmRestarts(
@@ -1314,47 +1115,18 @@ def build_finetune_components(model, device):
         T_mult=FINETUNE_T_MULT,
         eta_min=FINETUNE_ETA_MIN,
     )
-    # FEAT-4: 纯 MSE 主导。lc 保留一个很小的 Charbonnier 权重做数值正则，
-    # 其余感知/频域/小波/噪声项权重降到接近 0（不完全为 0，防止极端情况下
-    # 输出出现不合理的高频伪影；如需严格"纯 MSE"可直接把这些设为 0）。
     criterion_ft = CompositeLoss(
-        lc=0.05, ls=0.0, lp=0.0,
-        lf=0.0, lw=0.0, ln=0.0, le=0.0,
-        lmse=1.0,
+        lc=0.8, ls=1.8, lp=0.05,
+        lf=0.05, lw=0.1, ln=0.2, le=0.5,
     ).to(device)
     return optimizer_ft, scheduler_ft, criterion_ft
-
-
-# =============================================================================
-# FEAT-6: SWA —— 对 checkpoint 权重做算术平均（而非输出平均）
-# =============================================================================
-def swa_average_checkpoints(ckpt_paths, device, key='model'):
-    """
-    对若干 checkpoint 里 state_dict[key] 做逐参数算术平均。
-    要求所有 checkpoint 结构一致（同一分辨率/同一模型定义下的最后几个 ckpt）。
-    """
-    assert len(ckpt_paths) > 0
-    avg_state = None
-    n = len(ckpt_paths)
-    for p in ckpt_paths:
-        ckpt = torch.load(p, map_location=device)
-        state = {k.replace('module.', ''): v for k, v in ckpt[key].items()}
-        if avg_state is None:
-            avg_state = {k: v.clone().float() for k, v in state.items()}
-        else:
-            for k in avg_state:
-                avg_state[k] += state[k].float()
-    for k in avg_state:
-        avg_state[k] /= n
-    return avg_state
 
 
 # =============================================================================
 # 单折训练函数（被 4-fold 主循环调用）
 # =============================================================================
 def train_one_fold(fold_idx, train_patients, val_patients, test_patients,
-                   device, BASE_DIR, LDCT_ROOT, NDCT_ROOT, NUM_WORKERS,
-                   in_ch=IN_CH):
+                   device, BASE_DIR, LDCT_ROOT, NDCT_ROOT, NUM_WORKERS):
     print(f"\n{'#' * 70}")
     print(f"#  Fold {fold_idx + 1}/4")
     print(f"{'#' * 70}")
@@ -1367,13 +1139,13 @@ def train_one_fold(fold_idx, train_patients, val_patients, test_patients,
 
     NUM_EPOCHS = FINETUNE_START + FINETUNE_EPOCHS
 
-    # Dataset & Loader  (FEAT-1: 传入 in_ch 做 2.5D 堆叠)
+    # Dataset & Loader
     train_ds = LDCTDataset(LDCT_ROOT, NDCT_ROOT, train_patients,
-                           mode='train', patch_size=128, in_ch=in_ch)
+                           mode='train', patch_size=128)
     val_ds   = LDCTDataset(LDCT_ROOT, NDCT_ROOT, val_patients,
-                           mode='val', patch_size=0, in_ch=in_ch)
+                           mode='val', patch_size=0)
     test_ds  = LDCTDataset(LDCT_ROOT, NDCT_ROOT, test_patients,
-                           mode='test', patch_size=0, in_ch=in_ch)
+                           mode='test', patch_size=0)
 
     cur_ps = get_patch_size(1)
     cur_batch = get_batch_size(cur_ps)
@@ -1381,27 +1153,25 @@ def train_one_fold(fold_idx, train_patients, val_patients, test_patients,
     val_loader   = make_loader(val_ds, batch_size=1, num_workers=0, shuffle=False)
     test_loader  = make_loader(test_ds, batch_size=1, num_workers=0, shuffle=False)
 
-    print(f"[初始] patch={cur_ps}  batch={cur_batch}  in_ch(2.5D)={in_ch}")
+    print(f"[初始] patch={cur_ps}  batch={cur_batch}")
 
-    # Model  (FEAT-7: drop/attn_drop 默认置 0)
+    # Model
     model = LDCTDenoiserV4(
-        in_ch=in_ch, bc=88, growth=32,
+        in_ch=1, bc=88, growth=32,
         bot_depth=4, bot_heads=8, ws=8,
         dec_depths=(2, 2, 2, 2),
-        drop=0., attn_drop=0.,
+        drop=0.05, attn_drop=0.05,
     ).to(device)
 
     n_params = sum(p.numel() for p in model.parameters()) / 1e6
     print(f"Parameters: {n_params:.1f}M")
 
-    # BUGFIX-C: EMA decay 从 0.9999 降到 0.999，并使用 warmup
-    ema = EMA(model, decay=0.999)
+    ema = EMA(model, decay=0.9999)
 
     # Optimizer / Scheduler / Criterion (主训练阶段)
-    # FEAT-7: 使用分组 weight decay
     WARMUP = 10
-    optimizer = optim.AdamW(build_param_groups(model, weight_decay=5e-5),
-                            lr=1e-4, betas=(0.9, 0.999))
+    optimizer = optim.AdamW(model.parameters(), lr=1e-4,
+                            weight_decay=5e-5, betas=(0.9, 0.999))
 
     def lr_lambda(ep):
         if ep < WARMUP:
@@ -1429,12 +1199,10 @@ def train_one_fold(fold_idx, train_patients, val_patients, test_patients,
 
     history = {'train_loss': []}
     best_psnr = 0.
-    best_psnr_raw = 0.  # BUGFIX-C: 裸模型（非 EMA）的最佳 PSNR，用于对比取优
     start_epoch = 1
     recent_ckpts = []
     recent_best_ckpts = []
     best_ever_path = None
-    finetune_ckpt_paths = []  # FEAT-6: 记录 fine-tune 阶段的 ckpt 路径供 SWA 使用
 
     optimizer_ft = None
     scheduler_ft = None
@@ -1478,39 +1246,12 @@ def train_one_fold(fold_idx, train_patients, val_patients, test_patients,
         model.load_state_dict(state)
         if 'ema' in ckpt:
             ema.shadow.load_state_dict(ckpt['ema'])
-        if 'ema_step' in ckpt:
-            ema.load_step(ckpt['ema_step'])
+        if 'opt' in ckpt:
+            optimizer.load_state_dict(ckpt['opt'])
         history = ckpt.get('history', history)
         best_psnr = ckpt.get('best_psnr', ckpt_psnr)
-        best_psnr_raw = ckpt.get('best_psnr_raw', best_psnr_raw)
         start_epoch = ckpt['epoch'] + 1
         in_finetune = ckpt.get('in_finetune', False)
-
-        # BUGFIX-A: 如果 resume 时已经越过 fine-tune 分界点（in_finetune=True），
-        # 必须在这里就把 optimizer_ft / scheduler_ft / criterion_ft 建好，
-        # 否则训练循环里 "epoch == FINETUNE_START + 1 and not in_finetune" 分支
-        # 永远不会触发（因为 in_finetune 已经是 True），下面 cur_optimizer 仍是
-        # None，第一次 zero_grad() 就会 AttributeError。
-        if in_finetune:
-            optimizer_ft, scheduler_ft, criterion_ft = \
-                build_finetune_components(model, device)
-            if 'opt' in ckpt:
-                optimizer_ft.load_state_dict(ckpt['opt'])
-            # BUGFIX-B: 恢复 scheduler，否则 LambdaLR/CosineAnnealingWarmRestarts
-            # 的 last_epoch 会回到 0，学习率从头重启，把已收敛的模型打散
-            if 'sched' in ckpt:
-                scheduler_ft.load_state_dict(ckpt['sched'])
-            scaler = torch.amp.GradScaler('cuda')
-            if 'scaler' in ckpt:
-                scaler.load_state_dict(ckpt['scaler'])
-        else:
-            if 'opt' in ckpt:
-                optimizer.load_state_dict(ckpt['opt'])
-            if 'sched' in ckpt:
-                scheduler.load_state_dict(ckpt['sched'])
-            if 'scaler' in ckpt:
-                scaler.load_state_dict(ckpt['scaler'])
-
         recent_best_ckpts = rebuild_recent_best_ckpts(SAVE_DIR)
         if recent_best_ckpts:
             def _psnr_of(p):
@@ -1522,19 +1263,7 @@ def train_one_fold(fold_idx, train_patients, val_patients, test_patients,
                 except ValueError:
                     return -1.0
             best_ever_path = max(recent_best_ckpts, key=_psnr_of)
-
-        # 找回 fine-tune 阶段已产生的 ckpt，供后续 SWA 使用
-        if in_finetune:
-            ft_ckpts = glob.glob(os.path.join(SAVE_DIR, 'ckpt_ep*.pth'))
-            def _ep_of(p):
-                m = re.search(r'_ep(\d+)', os.path.basename(p))
-                return int(m.group(1)) if m else -1
-            finetune_ckpt_paths = sorted(
-                [p for p in ft_ckpts if _ep_of(p) > FINETUNE_START],
-                key=_ep_of)
-
-        print(f"[Resume] 从 epoch {ckpt['epoch']} 恢复，将从 epoch {start_epoch} 继续  "
-              f"(in_finetune={in_finetune})")
+        print(f"[Resume] 从 epoch {ckpt['epoch']} 恢复，将从 epoch {start_epoch} 继续")
         print(f"[Resume] 已找到 {len(recent_best_ckpts)} 个历史 best_P*.pth 文件\n")
     else:
         print("\n[Resume] 未找到 checkpoint，从头训练\n")
@@ -1553,23 +1282,18 @@ def train_one_fold(fold_idx, train_patients, val_patients, test_patients,
     for epoch in range(start_epoch, NUM_EPOCHS + 1):
 
         # Fine-tune 切换
-        # BUGFIX-A: 条件从 "epoch == FINETUNE_START + 1 and not in_finetune"
-        # 改为 "epoch > FINETUNE_START and optimizer_ft is None"。
-        # 原条件在从 epoch > FINETUNE_START+1 的 checkpoint（此时 in_finetune
-        # 已经是 True）恢复训练时永远不成立，导致 optimizer_ft 保持 None。
-        # 新条件只要越过分界点且 optimizer_ft 还没建过就会触发，且已经在
-        # resume 分支里处理过 in_finetune=True 的情况，这里不会重复初始化。
-        if epoch > FINETUNE_START and optimizer_ft is None:
+        if epoch == FINETUNE_START + 1 and not in_finetune:
             in_finetune = True
             optimizer_ft, scheduler_ft, criterion_ft = \
                 build_finetune_components(model, device)
             scaler = torch.amp.GradScaler('cuda')
             print(f"\n{'=' * 60}")
             print(f"[OPT-2] 切换至 Fine-tune 阶段")
-            print(f"  optimizer : AdamW  lr={FINETUNE_LR}  weight_decay=0 (分组)")
+            print(f"  optimizer : AdamW  lr={FINETUNE_LR}  weight_decay=0")
             print(f"  scheduler : CosineAnnealingWarmRestarts "
                   f"T_0={FINETUNE_T0}  T_mult={FINETUNE_T_MULT}")
-            print(f"  criterion : lc=0.05 lmse=1.0 (纯 MSE 主导, FEAT-4)")
+            print(f"  criterion : lc=0.8 ls=1.8 lp=0.05 "
+                  f"lf=0.05 lw=0.1 ln=0.2 le=0.5")
             print(f"{'=' * 60}\n")
 
         cur_optimizer = optimizer_ft if in_finetune else optimizer
@@ -1621,8 +1345,7 @@ def train_one_fold(fold_idx, train_patients, val_patients, test_patients,
                 model.train()
                 ph = to_hu(pred_vis[0, 0])
                 gh = to_hu(ndct[0, 0])
-                lc_ = ldct.shape[1] // 2
-                lh = to_hu(ldct[0, lc_])
+                lh = to_hu(ldct[0, 0])
                 ps, ss, ms = compute_metrics(ph, gh)
                 fig, ax = plt.subplots(1, 3, figsize=(15, 5))
                 smart_imshow(ax[0], lh, "LDCT")
@@ -1656,42 +1379,21 @@ def train_one_fold(fold_idx, train_patients, val_patients, test_patients,
         if epoch % 10 == 0:
             ema.eval()
             use_tta_eval = in_finetune
-
-            # BUGFIX-C: 每次验证同时评测 EMA 和裸模型，取更优的那个作为
-            # 本次的"最佳候选"。避免长期只看 ema.shadow、从不检验裸模型的
-            # 问题被隐藏起来。
             avg_p, avg_s, avg_m = evaluate(
                 ema.shadow, val_loader, device,
                 SAVE_DIR, tile=256, overlap=64,
-                tag=f'val_ep{epoch}_ema',
+                tag=f'val_ep{epoch}',
                 use_tta=use_tta_eval,
-                method_name=f'HCT-UNet_fold{fold_idx}_ema')
-
-            model.eval()
-            avg_p_raw, avg_s_raw, avg_m_raw = evaluate(
-                model, val_loader, device,
-                SAVE_DIR, tile=256, overlap=64,
-                tag=f'val_ep{epoch}_raw',
-                use_tta=use_tta_eval,
-                method_name=f'HCT-UNet_fold{fold_idx}_raw')
+                method_name=f'HCT-UNet_fold{fold_idx}')
             model.train()
-
-            use_ema_for_ckpt = avg_p >= avg_p_raw
-            print(f"  [ep{epoch}] EMA PSNR={avg_p:.2f}  raw PSNR={avg_p_raw:.2f}  "
-                  f"→ 使用 {'EMA' if use_ema_for_ckpt else 'raw'} 作为本次候选")
-
-            best_psnr_raw = max(best_psnr_raw, avg_p_raw)
 
             save_data = {
                 'epoch': epoch,
                 'best_psnr': best_psnr,
-                'best_psnr_raw': best_psnr_raw,
                 'model': model.state_dict(),
                 'ema': ema.shadow.state_dict(),
-                'ema_step': ema.state_dict_step(),
                 'opt': cur_optimizer.state_dict(),
                 'sched': cur_scheduler.state_dict(),
-                'scaler': scaler.state_dict(),
                 'history': history,
                 'in_finetune': in_finetune,
             }
@@ -1700,25 +1402,19 @@ def train_one_fold(fold_idx, train_patients, val_patients, test_patients,
             torch.save(save_data, ckpt_save_path)
             recent_ckpts.append(ckpt_save_path)
 
-            # FEAT-6: fine-tune 阶段记录 ckpt 路径供 SWA 使用
-            if in_finetune:
-                finetune_ckpt_paths.append(ckpt_save_path)
-
             while len(recent_ckpts) > 2:
                 oldest = recent_ckpts.pop(0)
-                if os.path.exists(oldest) and 'best' not in oldest \
-                        and oldest not in finetune_ckpt_paths:
+                if os.path.exists(oldest) and 'best' not in oldest:
                     os.remove(oldest)
                     print(f"  [清理] {os.path.basename(oldest)}")
 
-            best_candidate = max(avg_p, avg_p_raw)
-            if best_candidate > best_psnr:
-                best_psnr = best_candidate
+            if avg_p > best_psnr:
+                best_psnr = avg_p
                 best_save_path = os.path.join(
-                    SAVE_DIR, f'best_P{best_candidate:.2f}_ep{epoch:03d}.pth')
+                    SAVE_DIR, f'best_P{avg_p:.2f}_ep{epoch:03d}.pth')
                 save_data['best_psnr'] = best_psnr
                 torch.save(save_data, best_save_path)
-                print(f"  [best] PSNR={best_candidate:.2f} dB → {best_save_path}")
+                print(f"  [best] PSNR={avg_p:.2f} dB → {best_save_path}")
 
                 best_ever_path = best_save_path
                 recent_best_ckpts.append(best_save_path)
@@ -1733,35 +1429,7 @@ def train_one_fold(fold_idx, train_patients, val_patients, test_patients,
                         print(f"  [清理best] {os.path.basename(oldest_best)}")
 
             print(f"  [ckpt] ep{epoch:03d}  "
-                  f"PSNR={best_candidate:.2f}  (best={best_psnr:.2f})")
-
-    # FEAT-6: SWA —— 对 fine-tune 阶段最后 SWA_LAST_N 个 checkpoint 做权重平均
-    swa_state = None
-    if len(finetune_ckpt_paths) >= 2:
-        n_use = min(SWA_LAST_N, len(finetune_ckpt_paths))
-        swa_paths = finetune_ckpt_paths[-n_use:]
-        print(f"\n[SWA] 对最后 {n_use} 个 fine-tune checkpoint 做权重平均:")
-        for p in swa_paths:
-            print(f"  - {os.path.basename(p)}")
-        swa_state = swa_average_checkpoints(swa_paths, device, key='model')
-
-        swa_model = LDCTDenoiserV4(
-            in_ch=in_ch, bc=88, growth=32,
-            bot_depth=4, bot_heads=8, ws=8,
-            dec_depths=(2, 2, 2, 2),
-            drop=0., attn_drop=0.,
-        ).to(device)
-        swa_model.load_state_dict(swa_state)
-
-        print("\n[SWA] 验证集评估 SWA 平均权重...")
-        swa_p, swa_s, swa_m = evaluate(
-            swa_model, val_loader, device, SAVE_DIR,
-            tile=256, overlap=64, tag='val_swa', use_tta=True,
-            method_name=f'HCT-UNet_fold{fold_idx}_swa')
-        torch.save({'model': swa_model.state_dict(), 'psnr': swa_p, 'ssim': swa_s},
-                   os.path.join(SAVE_DIR, f'swa_P{swa_p:.2f}.pth'))
-    else:
-        print("\n[SWA] fine-tune 阶段 checkpoint 不足 2 个，跳过 SWA")
+                  f"PSNR={avg_p:.2f}  (best={best_psnr:.2f})")
 
     # 训练结束 → 最终评估
     print("\n训练完成！最终验证集评估 (EMA + TTA)...")
@@ -1771,41 +1439,11 @@ def train_one_fold(fold_idx, train_patients, val_patients, test_patients,
              method_name=f'HCT-UNet_fold{fold_idx}')
     plot_history(history, SAVE_DIR)
 
-    # 测试集：EMA / raw / SWA 三者都评一遍，选最优的报告为该折最终结果
     print("\n测试集最终评估 (EMA + TTA)...")
-    ema_p, ema_s, ema_m = evaluate(
+    avg_p, avg_s, avg_m = evaluate(
         ema.shadow, test_loader, device, SAVE_DIR,
-        tile=256, overlap=64, tag='test_final_ema', use_tta=True,
-        method_name=f'HCT-UNet_fold{fold_idx}_ema')
-
-    print("\n测试集最终评估 (raw + TTA)...")
-    raw_p, raw_s, raw_m = evaluate(
-        model, test_loader, device, SAVE_DIR,
-        tile=256, overlap=64, tag='test_final_raw', use_tta=True,
-        method_name=f'HCT-UNet_fold{fold_idx}_raw')
-
-    candidates = [('ema', ema_p, ema_s, ema_m)]
-    candidates.append(('raw', raw_p, raw_s, raw_m))
-
-    if swa_state is not None:
-        print("\n测试集最终评估 (SWA + TTA)...")
-        swa_model_test = LDCTDenoiserV4(
-            in_ch=in_ch, bc=88, growth=32,
-            bot_depth=4, bot_heads=8, ws=8,
-            dec_depths=(2, 2, 2, 2),
-            drop=0., attn_drop=0.,
-        ).to(device)
-        swa_model_test.load_state_dict(swa_state)
-        swa_p2, swa_s2, swa_m2 = evaluate(
-            swa_model_test, test_loader, device, SAVE_DIR,
-            tile=256, overlap=64, tag='test_final_swa', use_tta=True,
-            method_name=f'HCT-UNet_fold{fold_idx}_swa')
-        candidates.append(('swa', swa_p2, swa_s2, swa_m2))
-
-    best_tag, avg_p, avg_s, avg_m = max(candidates, key=lambda c: c[1])
-    print(f"\n[Fold {fold_idx}] 测试集最终选择: {best_tag}  "
-          f"PSNR={avg_p:.2f}  SSIM={avg_s:.4f}  MSE={avg_m:.2f}")
-
+        tile=256, overlap=64, tag='test_final', use_tta=True,
+        method_name=f'HCT-UNet_fold{fold_idx}')
     print(f"\nFold {fold_idx} 所有文件保存至: {SAVE_DIR}")
 
     return {
@@ -1813,7 +1451,6 @@ def train_one_fold(fold_idx, train_patients, val_patients, test_patients,
         'psnr': avg_p,
         'ssim': avg_s,
         'mse': avg_m,
-        'source': best_tag,
         'test_patients': test_patients,
         'best_psnr': best_psnr,
     }
@@ -1836,7 +1473,7 @@ def main():
     print(f"\n4-Fold Cross-Validation 患者划分:")
     for i, fold in enumerate(FOLDS):
         print(f"  Fold {i}: {fold}")
-    print(f"\n2.5D 输入窗口 in_ch = {IN_CH}\n")
+    print()
 
     all_fold_results = []
 
@@ -1849,19 +1486,17 @@ def main():
 
         result = train_one_fold(
             fold_idx, train_patients, val_patients, test_patients,
-            device, BASE_DIR, LDCT_ROOT, NDCT_ROOT, NUM_WORKERS,
-            in_ch=IN_CH,
+            device, BASE_DIR, LDCT_ROOT, NDCT_ROOT, NUM_WORKERS
         )
         all_fold_results.append(result)
 
     # ========== 跨折汇总 ==========
     print("\n" + "=" * 70)
-    print("4-Fold Cross-Validation Summary (Test set, best of EMA/raw/SWA + TTA)")
+    print("4-Fold Cross-Validation Summary (Test set, EMA + TTA)")
     print("=" * 70)
     for r in all_fold_results:
         print(f"Fold {r['fold']}: PSNR={r['psnr']:.2f}  "
               f"SSIM={r['ssim']:.4f}  MSE={r['mse']:.2f}  "
-              f"source={r['source']}  "
               f"Test={r['test_patients']}  (val-best PSNR={r['best_psnr']:.2f})")
 
     mean_p = np.mean([r['psnr'] for r in all_fold_results])
@@ -1885,7 +1520,6 @@ def main():
         for r in all_fold_results:
             f.write(f"Fold {r['fold']}: PSNR={r['psnr']:.2f}  "
                     f"SSIM={r['ssim']:.4f}  MSE={r['mse']:.2f}  "
-                    f"source={r['source']}  "
                     f"Test={r['test_patients']}\n")
         f.write(f"\nMean ± Std:\n")
         f.write(f"  PSNR : {mean_p:.2f} ± {std_p:.2f} dB\n")
